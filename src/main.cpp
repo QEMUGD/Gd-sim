@@ -1,5 +1,3 @@
-Here is your fully updated Geode mod (main.cpp) with all your requested features built-in:
-main.cpp
 #include <Geode/Geode.hpp>
 #include <Geode/modify/GJBaseGameLayer.hpp>
 #include <Geode/modify/PlayLayer.hpp>
@@ -536,4 +534,3 @@ class $modify(PFPlayLayer, PlayLayer) {
         }
     }
 };
-
