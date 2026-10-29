@@ -15,9 +15,9 @@ endif()
 add_subdirectory($ENV{GEODE_SDK} ${CMAKE_CURRENT_BINARY_DIR}/geode)
 
 # ImGui for Cocos2d (Windows + Android)
-CPMAddPackage("gh:matcool/gd-imgui-cocos#main")
+CPMAddPackage("gh:matcool/gd-imgui-cocos#geode")
 
-# gd-imgui-cocos' main branch still uses the old CCIMEDelegate/CCKeyboardDelegate
+# gd-imgui-cocos may still use the old CCIMEDelegate/CCKeyboardDelegate
 # signatures; current Geode added extra parameters. Patch them in place (idempotent).
 set(_IC_DIR "${${CPM_LAST_PACKAGE_NAME}_SOURCE_DIR}")
 foreach(_f "${_IC_DIR}/include/imgui-cocos.hpp" "${_IC_DIR}/src/main.cpp")
