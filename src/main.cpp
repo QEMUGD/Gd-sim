@@ -526,17 +526,17 @@ static void tick(PlayLayer* pl) {
     }
 
     SimParams s = buildParams(p, m);
-    auto near = nearHazards(p, s, false);
-    if (near.empty()) return;
+    auto nearRects = nearHazards(p, s, false);
+    if (nearRects.empty()) return;
 
     Policy none{0, 0, 0};
-    int base = survive(s, none, near);
+    int base = survive(s, none, nearRects);
     if (base >= s.steps) return;                 // current input survives
 
     Policy best = none;
     int bestSurv = base;
     for (auto const& c : candidates(m, s.steps)) {
-        int r = survive(s, c, near);
+        int r = survive(s, c, nearRects);
         if (r >= s.steps) { best = c; break; }   // earliest fully safe plan
         if (r > bestSurv) { bestSurv = r; best = c; }
     }
@@ -633,13 +633,13 @@ class $modify(PFPlayLayer, PlayLayer) {
         Mode m = modeOf(p);
         g.modeName = modeName(m);
         SimParams s = buildParams(p, m);
-        auto near = nearHazards(p, s, g.overlay);
+        auto nearRects = nearHazards(p, s, g.overlay);
         Policy none{0, 0, 0};
-        g.jumpSafe = survive(s, none, near) >= s.steps;
+        g.jumpSafe = survive(s, none, nearRects) >= s.steps;
 
         if (g.overlay && rt.draw) {
             std::vector<CCPoint> path;
-            survive(s, none, near, &path);
+            survive(s, none, nearRects, &path);
             ccColor4F col = g.jumpSafe ? ccColor4F{0.2f, 1.f, 0.4f, 0.8f}
                                        : ccColor4F{1.f, 0.6f, 0.1f, 0.8f};
             for (auto const& pt : path) rt.draw->drawDot(pt, 2.5f, col);
