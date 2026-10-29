@@ -6,9 +6,9 @@
   },
   "id": "qemugd.pathfinder",
   "name": "Pathfinder",
-  "version": "v2.1.0",
+  "version": "v3.0.0",
   "developer": "qemugd",
-  "description": "Plays levels (all gamemodes) with a physics look-ahead and exports the inputs as a .gdr2 replay for Eclipse and other GDR2 bots. Physics from camila314's gdp.",
+  "description": "Cube button on level pages: maps the level, bots it with a physics look-ahead, retries on failure, and exports a .gdr2 replay for Eclipse. Physics from camila314's gdp.",
   "tags": [
     "utility",
     "interface",
