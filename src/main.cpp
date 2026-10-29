@@ -1,18 +1,20 @@
 // Pathfinder - Geode mod for Geometry Dash 2.2081 (Windows + Android)
 // Author: qemugd  https://github.com/qemugd/gd-sim
 //
-// Press the cube button on a level page, pick settings, press OK. The mod maps
-// the level (hazards + solid blocks), plays it with a physics look-ahead, logs
-// every failed attempt, re-maps with extra caution around the failure and tries
-// again until it passes. Every input is recorded on its exact physics frame and
-// exported as a .gdr2 replay (Eclipse Menu and other GDR2 bots).
+// Press the cube button on a level page, pick settings, press OK. The mod
+//   1. maps the level (hazards, solid blocks, portals),
+//   2. plans a whole-level macro (holds and taps) in a physics simulation,
+//   3. verifies that macro in the simulation and retries with other margins if it fails,
+//   4. plays the verified macro in the real game, re-planning if the run drifts,
+//   5. on a death: logs it, widens the caution around it, re-maps and plans again,
+//   6. when the level is passed, saves the inputs as a .gdr2 replay (Eclipse Menu etc.).
 //
 // Credits
 //   * Physics model: camila314's GD physics decompilations (camila314/gdp,
 //     2.2 branch, used with permission). Constants and formulas below come from
 //       - PlayerObject::updateTimeMod  (yStart / gravity / speed per speed portal)
 //       - PlayerObject::updateJump     (jump rules for every vehicle, mini scaling,
-//                                       gravity formula, fall clamps)
+//                                       gravity formula, fall clamps, robot boost)
 //       - GJBaseGameLayer::update      (step count = delta * 240, physicsDelta)
 //       - PlayLayer::destroyPlayer     (death handling)
 //   * Replay format: maxnut/GDReplayFormat (gdr2)
@@ -36,9 +38,9 @@ using namespace geode::prelude;
 
 // ==== SIM BEGIN
 // ================================================================= physics (gdp)
-static constexpr double kDt = 0.25;   // one 240 Hz step, in 1/60 s "frame units"
+static constexpr double kDt = 0.25;           // one 240 Hz step, in 1/60 s "frame units"
 static constexpr double kStepSeconds = 1.0 / 240.0;
-static constexpr double kFallClamp = 15.0;   // ground-vehicle fall clamp
+static constexpr double kFallClamp = 15.0;    // ground-vehicle fall clamp
 static constexpr double kFlyGravity = 0.9582; // usedGravity for ball/flying/spider
 
 struct SpeedProfile { double yStart, gravity, speedMult; };
@@ -63,221 +65,350 @@ static char const* modeName(Mode m) {
     }
     return "?";
 }
-static bool holdMode(Mode m)   { return m == Mode::Ship || m == Mode::Wave || m == Mode::Robot; }
 static bool groundMode(Mode m) { return m == Mode::Cube || m == Mode::Ball || m == Mode::Robot || m == Mode::Spider; }
 
-struct SimParams {
-    CCRect start;
-    Mode   mode;
-    bool   mini;
-    double vx;          // units per second
-    double yStart;      // base jump velocity for this speed
-    double jumpScale;   // 0.8 when mini (ground vehicles)
-    double gBase;       // profile gravity * gravityMod
-    double gAlt;        // 0.9582 * gravityMod
-    double waveV;       // wave vertical speed (playerSpeed * speedMult)
-    double flip0;
-    double vy0;
-    bool   grounded0;
-    bool   held0;
-    double floorRel, ceilRel;  // level bounds, relative to start y
-    int    lockSteps;   // CPS lock: min 240 Hz steps between presses (0 = off)
-    int    sinceLast;   // 240 Hz steps since the last press
-    int    steps;
-    float  margin;
+// level events found by mapping (portals), identified by their fixed object IDs
+enum class EvtType { SetMode, SetGravity, SetMini, SetSpeed };
+struct Evt { float x, minY, maxY; EvtType type; int ival; double dval; };
+
+struct Zone { float x0, x1; double extra; int fails; };   // extra caution learned from failures
+
+struct Env {
+    std::vector<CCRect> const* hz = nullptr;    // sorted by minX
+    std::vector<CCRect> const* sol = nullptr;   // sorted by minX
+    std::vector<Evt> const* evts = nullptr;     // sorted by x
+    std::vector<Zone> const* zones = nullptr;
+    bool   useZones = true;
+    double floorBottom = 90.0;     // lowest allowed rect minY
+    double ceilTop = 390.0;        // highest allowed rect maxY
+    double gmod = 1.0;
+    float  margin = 2.f;           // extra clearance around hazards
+    int    lockSteps = 0;          // CPS lock: min 240 Hz steps between presses (0 = off)
+    bool   allowHold = true;
+    double xEnd = 1e9;
 };
 
-// kind: 0 keep current input, 1 click at a, 2 toggle hold at a (and back after b),
-//       3 hold from a for b steps, 4 click at a then every b steps
-struct Policy { int kind, a, b; };
+// one vehicle state; x/y are the player rect's minX/minY
+struct SState {
+    double x = 0, y = 0, w = 30, h = 30;
+    double vy = 0, flip = 1, accel = 0, speed = 0.9;
+    Mode mode = Mode::Cube;
+    bool mini = false, grounded = true, down = false;
+    int lastPress = -100000;
+    int nextEvt = 0;
+};
 
-// Simulates the vehicle in 240 Hz steps and returns how many steps it survives
-// (== s.steps means no hazard / wall was touched). `hz` and `sol` must be sorted
-// by minX. The CPS lock is enforced here so plans never rely on a blocked click.
-static int survive(SimParams const& s, Policy const& pol,
-                   std::vector<CCRect> const& hz, std::vector<CCRect> const& sol,
-                   std::vector<CCPoint>* outPath = nullptr) {
-    double dx = 0, y = 0, vy = s.vy0, flip = s.flip0, accel = 0;
-    bool grounded = s.grounded0, prevHeld = s.held0;
-    int lastPress = -s.sinceLast;
-    float w = s.start.size.width, h = s.start.size.height;
-    double v16fly = s.mini ? 0.85 : 1.0;
-    size_t hLo = 0, sLo = 0;
+static float marginAt(Env const& e, double x) {
+    float m = e.margin;
+    if (e.useZones && e.zones) {
+        float extra = 0.f;
+        for (auto const& z : *e.zones) if (x >= z.x0 && x <= z.x1) extra = std::max(extra, (float)z.extra);
+        m += extra;
+    }
+    return m;
+}
+
+// Advances one 240 Hz physics step with the input `down` held. Returns false on death.
+static bool stepSim(SState& s, bool down, Env const& e, int stepNo) {
+    bool pressed = down && !s.down;
+    if (pressed) s.lastPress = stepNo;
+    s.down = down;
+
+    auto prof = profileFor((float)s.speed);
+    double jumpScale = s.mini ? 0.8 : 1.0, v16 = s.mini ? 0.85 : 1.0;
+    double gBase = prof.gravity * e.gmod, gAlt = kFlyGravity * e.gmod;
+    double vxu = s.speed * prof.speedMult * 60.0;
 
     auto clampFly = [&](double lo, double hi) {   // gravity-relative clamp
-        double u = vy * flip;
+        double u = s.vy * s.flip;
         if (u < lo) u = lo;
         if (u > hi) u = hi;
-        vy = u * flip;
+        s.vy = u * s.flip;
     };
-    auto clampFall = [&]() { if (vy * flip < -kFallClamp) vy = -kFallClamp * flip; };
+    auto clampFall = [&]() { if (s.vy * s.flip < -kFallClamp) s.vy = -kFallClamp * s.flip; };
 
-    for (int i = 0; i < s.steps; i++) {
-        bool click = false, held = s.held0;
-        switch (pol.kind) {
-            case 1: click = (i == pol.a); break;
-            case 2:
-                if (i >= pol.a) held = !s.held0;
-                if (pol.b > 0 && i >= pol.a + pol.b) held = s.held0;
-                break;
-            case 3: held = (i >= pol.a && i < pol.a + pol.b); click = (i == pol.a); break;
-            case 4: click = (i >= pol.a && pol.b > 0 && (i - pol.a) % pol.b == 0); break;
-            default: break;
-        }
-        // CPS lock
-        bool press = click || (held && !prevHeld);
-        if (press) {
-            if (s.lockSteps <= 0 || i - lastPress >= s.lockSteps) lastPress = i;
-            else { click = false; if (held && !prevHeld) held = false; }
-        }
-        prevHeld = held;
+    double floorY = e.floorBottom, ceilY = e.ceilTop - s.h;
+    bool trig = pressed || (down && s.grounded);   // holding re-triggers on landing
 
-        switch (s.mode) {
-        case Mode::Cube:
-            if (click && grounded) { vy = flip * s.yStart * s.jumpScale; grounded = false; }
-            else if (!grounded)    { vy -= s.gBase * kDt * flip; clampFall(); }
-            break;
-        case Mode::Ball:
-            if (click && grounded) {
-                vy = flip * s.yStart * s.jumpScale;
-                flip = -flip;
-                vy *= 0.6;
-                grounded = false;
-            } else if (!grounded) { vy -= s.gAlt * kDt * flip * 0.6; clampFall(); }
-            break;
-        case Mode::Robot:
-            if ((click || held) && grounded) {
-                vy = flip * s.yStart * 0.5 * s.jumpScale; grounded = false; accel = 0;
-            } else if (!grounded) {
-                if (held && accel < 1.5) accel += kDt / 10.0;      // gravity cancelled while boosting
-                else { vy -= s.gBase * kDt * flip * 0.9; clampFall(); }
-            }
-            break;
-        case Mode::Spider:
-            if (click && grounded) {                // teleports to the opposite surface
-                flip = -flip;
-                y = flip > 0 ? s.floorRel : s.ceilRel;
-                vy = 0; grounded = true;
-            } else if (!grounded) { vy -= s.gAlt * kDt * flip * 0.6; clampFall(); }
-            break;
-        case Mode::Ship: {
-            double dv = held ? (s.gAlt * kDt * 0.4 / v16fly)
-                             : (-1.2 * s.gAlt * kDt * 0.4 / v16fly);
-            vy += dv * flip;
-            clampFly(-6.4 / v16fly, 8.0 / v16fly);
-            break;
+    switch (s.mode) {
+    case Mode::Cube:
+        if (trig && s.grounded) { s.vy = s.flip * prof.yStart * jumpScale; s.grounded = false; }
+        else if (!s.grounded)   { s.vy -= gBase * kDt * s.flip; clampFall(); }
+        break;
+    case Mode::Ball:
+        if (trig && s.grounded) {
+            s.vy = s.flip * prof.yStart * jumpScale;
+            s.flip = -s.flip;
+            s.vy *= 0.6;
+            s.grounded = false;
+        } else if (!s.grounded) { s.vy -= gAlt * kDt * s.flip * 0.6; clampFall(); }
+        break;
+    case Mode::Robot:
+        if ((pressed || down) && s.grounded) {
+            s.vy = s.flip * prof.yStart * 0.5 * jumpScale; s.grounded = false; s.accel = 0;
+        } else if (!s.grounded) {
+            if (down && s.accel < 1.5) s.accel += kDt / 10.0;      // gravity cancelled while boosting
+            else { s.vy -= gBase * kDt * s.flip * 0.9; clampFall(); }
         }
-        case Mode::Ufo: {
-            if (click) {
-                double v = (s.mini ? 8.0 : 7.0) * v16fly;
-                if (v > vy * flip) vy = flip * v;
-            }
-            vy -= s.gAlt * kDt * flip * 1.2 * 0.5 / v16fly;
-            clampFly(-6.4 / v16fly, 8.0 / v16fly);
-            break;
+        break;
+    case Mode::Spider:
+        if (trig && s.grounded) {                // teleports to the opposite surface
+            s.flip = -s.flip;
+            s.y = s.flip > 0 ? floorY : ceilY;
+            s.vy = 0; s.grounded = true;
+        } else if (!s.grounded) { s.vy -= gAlt * kDt * s.flip * 0.6; clampFall(); }
+        break;
+    case Mode::Ship: {
+        double dv = down ? (gAlt * kDt * 0.4 / v16) : (-1.2 * gAlt * kDt * 0.4 / v16);
+        s.vy += dv * s.flip;
+        clampFly(-6.4 / v16, 8.0 / v16);
+        break;
+    }
+    case Mode::Ufo: {
+        if (pressed) {
+            double v = (s.mini ? 8.0 : 7.0) * v16;
+            if (v > s.vy * s.flip) s.vy = s.flip * v;
         }
-        case Mode::Wave:
-            vy = flip * s.waveV * (held ? 1.0 : -1.0);
-            break;
-        case Mode::Swing:
-            if (click) { vy *= 0.8; flip = -flip; }
-            vy -= s.gAlt * kDt * flip * (s.mini ? 0.6 : 0.4);
-            clampFly(-8.0, 8.0);
-            break;
-        }
+        s.vy -= gAlt * kDt * s.flip * 1.2 * 0.5 / v16;
+        clampFly(-6.4 / v16, 8.0 / v16);
+        break;
+    }
+    case Mode::Wave:
+        s.vy = s.flip * s.speed * prof.speedMult * (down ? 1.0 : -1.0);
+        break;
+    case Mode::Swing:
+        if (pressed) { s.vy *= 0.8; s.flip = -s.flip; }
+        s.vy -= gAlt * kDt * s.flip * (s.mini ? 0.6 : 0.4);
+        clampFly(-8.0, 8.0);
+        break;
+    }
 
-        if (!grounded) y += vy * kDt;
-        dx += s.vx * kStepSeconds;
+    if (!s.grounded) s.y += s.vy * kDt;
+    s.x += vxu * kStepSeconds;
 
-        // level floor / ceiling: land on them (ground vehicles) or slide along them
-        bool supported = false;
-        if (y <= s.floorRel) {
-            y = s.floorRel; if (vy < 0) vy = 0;
-            if (flip > 0) { supported = true; if (groundMode(s.mode)) grounded = true; }
-        }
-        if (y >= s.ceilRel) {
-            y = s.ceilRel; if (vy > 0) vy = 0;
-            if (flip < 0) { supported = true; if (groundMode(s.mode)) grounded = true; }
-        }
+    // level floor / ceiling: land on them (ground vehicles) or slide along them
+    bool supported = false;
+    if (s.y <= floorY) {
+        s.y = floorY; if (s.vy < 0) s.vy = 0;
+        if (s.flip > 0) { supported = true; if (groundMode(s.mode)) s.grounded = true; }
+    }
+    if (s.y >= ceilY) {
+        s.y = ceilY; if (s.vy > 0) s.vy = 0;
+        if (s.flip < 0) { supported = true; if (groundMode(s.mode)) s.grounded = true; }
+    }
 
-        // solid blocks: land on top, bump underneath, die on the sides
-        double bx = s.start.origin.x + dx;
-        double rMinX = bx, rMaxX = bx + w;
-        while (sLo < sol.size() && sol[sLo].getMaxX() < rMinX - 2) sLo++;
-        for (size_t j = sLo; j < sol.size() && sol[j].getMinX() <= rMaxX + 2; ++j) {
-            auto const& b = sol[j];
-            double rMinY = s.start.origin.y + y, rMaxY = rMinY + h;
+    // solid blocks: land on top, bump underneath, die on the sides
+    double rMinX = s.x, rMaxX = s.x + s.w;
+    if (e.sol) {
+        auto const& sol = *e.sol;
+        auto it = std::lower_bound(sol.begin(), sol.end(), (float)(rMinX - 120.0),
+            [](CCRect const& r, float v) { return r.getMinX() < v; });
+        for (; it != sol.end() && it->getMinX() <= rMaxX + 2; ++it) {
+            auto const& b = *it;
+            if (b.getMaxX() < rMinX - 2) continue;
+            double rMinY = s.y, rMaxY = s.y + s.h;
             bool hOver = rMaxX > b.getMinX() + 0.5 && rMinX < b.getMaxX() - 0.5;
             if (!hOver) continue;
-            if (grounded) {   // resting contact keeps us supported
-                if (flip > 0 && std::abs(b.getMaxY() - rMinY) <= 2.0) supported = true;
-                if (flip < 0 && std::abs(b.getMinY() - rMaxY) <= 2.0) supported = true;
+            if (s.grounded) {   // resting contact keeps us supported
+                if (s.flip > 0 && std::abs(b.getMaxY() - rMinY) <= 2.0) supported = true;
+                if (s.flip < 0 && std::abs(b.getMinY() - rMaxY) <= 2.0) supported = true;
             }
             bool vOver = rMaxY > b.getMinY() + 1.0 && rMinY < b.getMaxY() - 1.0;
             if (!vOver) continue;
-            if (s.mode == Mode::Wave) return i;                 // wave dies on any block
-            double tol = std::max(4.0, std::abs(vy) * kDt + 2.0);
-            double feetPen = flip > 0 ? b.getMaxY() - rMinY : rMaxY - b.getMinY();
-            double headPen = flip > 0 ? rMaxY - b.getMinY() : b.getMaxY() - rMinY;
-            if (feetPen <= tol && vy * flip <= 0.0) {
-                y += flip * feetPen; vy = 0; supported = true;
-                if (groundMode(s.mode)) grounded = true;
-            } else if (headPen <= tol && vy * flip >= 0.0) {
-                y -= flip * headPen; if (vy * flip > 0) vy = 0;
+            if (s.mode == Mode::Wave) return false;              // wave dies on any block
+            double tol = std::max(4.0, std::abs(s.vy) * kDt + 2.0);
+            double feetPen = s.flip > 0 ? b.getMaxY() - rMinY : rMaxY - b.getMinY();
+            double headPen = s.flip > 0 ? rMaxY - b.getMinY() : b.getMaxY() - rMinY;
+            if (feetPen <= tol && s.vy * s.flip <= 0.0) {
+                s.y += s.flip * feetPen; s.vy = 0; supported = true;
+                if (groundMode(s.mode)) s.grounded = true;
+            } else if (headPen <= tol && s.vy * s.flip >= 0.0) {
+                s.y -= s.flip * headPen; if (s.vy * s.flip > 0) s.vy = 0;
             } else {
-                return i;                                        // side hit
+                return false;                                    // side hit
             }
         }
-        if (grounded && !supported) { grounded = false; vy = 0; } // ran off an edge
+    }
+    if (s.grounded && !supported) { s.grounded = false; s.vy = 0; } // ran off an edge
 
-        CCRect r((float)bx, (float)(s.start.origin.y + y), w, h);
-        if (outPath && i % 6 == 0) outPath->push_back({r.getMidX(), r.getMidY()});
-
-        // hazards
-        while (hLo < hz.size() && hz[hLo].getMaxX() < rMinX - s.margin - 2) hLo++;
-        for (size_t j = hLo; j < hz.size() && hz[j].getMinX() <= rMaxX + s.margin + 2; ++j) {
-            auto const& hzr = hz[j];
-            CCRect t(hzr.origin.x - s.margin, hzr.origin.y - s.margin,
-                     hzr.size.width + 2 * s.margin, hzr.size.height + 2 * s.margin);
-            if (r.intersectsRect(t)) return i;
+    // portals / events we pass
+    if (e.evts) {
+        auto const& ev = *e.evts;
+        double cx = s.x + s.w * 0.5;
+        while (s.nextEvt < (int)ev.size() && cx >= ev[s.nextEvt].x) {
+            auto const& v = ev[s.nextEvt++];
+            if (!(s.y + s.h > v.minY && s.y < v.maxY)) continue;  // flew past without touching it
+            switch (v.type) {
+                case EvtType::SetMode:
+                    s.mode = (Mode)v.ival; s.grounded = false; s.accel = 0; break;
+                case EvtType::SetGravity:
+                    s.flip = v.ival; s.grounded = false; break;
+                case EvtType::SetMini: {
+                    bool mini = v.ival != 0;
+                    if (mini != s.mini) {
+                        double k = mini ? 0.6 : 1.0 / 0.6;
+                        double cxm = s.x + s.w * 0.5, cym = s.y + s.h * 0.5;
+                        s.w *= k; s.h *= k;
+                        s.x = cxm - s.w * 0.5; s.y = cym - s.h * 0.5;
+                        s.mini = mini;
+                    }
+                    break;
+                }
+                case EvtType::SetSpeed: s.speed = v.dval; break;
+            }
         }
     }
-    return s.steps;
+
+    // hazards
+    if (e.hz) {
+        auto const& hz = *e.hz;
+        float m = marginAt(e, s.x);
+        CCRect r((float)s.x, (float)s.y, (float)s.w, (float)s.h);
+        auto it = std::lower_bound(hz.begin(), hz.end(), (float)(s.x - 130.0),
+            [](CCRect const& q, float v) { return q.getMinX() < v; });
+        for (; it != hz.end() && it->getMinX() <= rMaxX + m + 2; ++it) {
+            if (it->getMaxX() < rMinX - m - 2) continue;
+            CCRect t(it->origin.x - m, it->origin.y - m, it->size.width + 2 * m, it->size.height + 2 * m);
+            if (r.intersectsRect(t)) return false;
+        }
+    }
+    return true;
 }
 
-// Candidate input plans, ordered by how soon they act (earliest first).
-static std::vector<Policy> candidates(Mode m, int steps) {
-    std::vector<Policy> v;
-    if (m == Mode::Robot) {
-        for (int a : {0, 2, 4, 8, 14, 22, 32})
-            for (int b : {10, 20, 40, 60}) v.push_back({3, a, b});
-    } else if (m == Mode::Ship || m == Mode::Wave) {
-        for (int a : {0, 3, 6, 10, 15, 22, 32, 45, 60}) {
-            v.push_back({2, a, 0});
-            for (int b : {8, 16, 32}) v.push_back({2, a, b});
+// ------------------------------------------------------------------ planner
+// Forward reachability over "hold / release" choices, one choice per G steps.
+// Distinct states are merged, so the whole level is searched in one sweep.
+struct PlanOut {
+    bool reachedEnd = false;
+    int  layers = 0;
+    double reachX = 0;
+    std::vector<uint8_t> down;   // one entry per G steps
+};
+
+static uint64_t mix64(uint64_t h, uint64_t v) {
+    h ^= v + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+    return h;
+}
+
+static PlanOut planMacro(SState const& start, Env const& e, int G, int cap, int variant,
+                         int maxLayers, size_t maxNodes = 6000000) {
+    struct Node { int parent; uint8_t down; };
+    struct Cand { SState st; int node; int cost; };
+    std::vector<Node> nodes; nodes.reserve(1 << 16);
+    std::vector<Cand> cur, next;
+    std::vector<uint64_t> keys;       // parallel to `next`: merge key of each state
+    cur.push_back({start, -1, 0});
+    PlanOut out;
+    int bestNode = -1;
+    double bestX = start.x;
+    bool order[2] = {(variant % 2) != 0, (variant % 2) == 0};   // which choice to expand first
+
+    for (int layer = 0; layer < maxLayers; ++layer) {
+        next.clear(); keys.clear();
+        int stepNo = layer * G;
+        for (auto const& c : cur) {
+            for (int k = 0; k < 2; k++) {
+                bool act = order[k];
+                bool press = act && !c.st.down;
+                if (press && e.lockSteps > 0 && stepNo - c.st.lastPress < e.lockSteps) continue;
+                if (act && c.st.down && !e.allowHold) continue;
+                SState t = c.st;
+                bool alive = true;
+                for (int i = 0; i < G && alive; i++) alive = stepSim(t, act, e, stepNo + i);
+                if (!alive) continue;
+
+                uint64_t key = 1469598103934665603ULL;
+                key = mix64(key, (uint64_t)(int64_t)std::llround(t.y));
+                key = mix64(key, (uint64_t)(int64_t)std::llround(t.vy * 2.0));
+                key = mix64(key, (uint64_t)((t.flip > 0 ? 1 : 2) | ((int)t.mode << 2) | (t.grounded ? 64 : 0) |
+                                            (t.down ? 128 : 0) | (t.mini ? 256 : 0)));
+                key = mix64(key, (uint64_t)std::llround(t.accel * 4.0));
+                key = mix64(key, (uint64_t)std::min(t.lastPress >= -99999 ? stepNo + G - t.lastPress : 99999,
+                                                    std::max(e.lockSteps, 1)));
+                key = mix64(key, (uint64_t)t.nextEvt);
+                int cost = c.cost + (press ? 10 : 0) + (act ? 1 : 0);   // prefer few presses, short holds
+                int dup = -1;
+                for (int q = 0; q < (int)keys.size(); q++) if (keys[q] == key) { dup = q; break; }
+                nodes.push_back({c.node, (uint8_t)(act ? 1 : 0)});
+                if (dup >= 0) {                                   // merged duplicate: keep the cheaper path
+                    if (cost < next[dup].cost) next[dup] = {t, (int)nodes.size() - 1, cost};
+                    continue;
+                }
+                keys.push_back(key);
+                next.push_back({t, (int)nodes.size() - 1, cost});
+            }
         }
-    } else {
-        int lim = std::min(steps / 2, 60);
-        for (int a = 0; a <= lim; a += (a < 12 ? 1 : 3)) v.push_back({1, a, 0});
-        if (m == Mode::Ufo || m == Mode::Swing) {
-            for (int a : {0, 6, 12, 20})
-                for (int b : {10, 16, 24, 36}) v.push_back({4, a, b});
+        if (next.empty()) break;                         // stuck: no safe continuation
+        out.layers = layer + 1;
+
+        double maxX = -1e18; int maxI = 0;
+        for (int i = 0; i < (int)next.size(); i++) {
+            if (next[i].st.x > maxX + 1e-6 || (std::abs(next[i].st.x - maxX) <= 1e-6 && next[i].cost < next[maxI].cost)) {
+                maxX = next[i].st.x; maxI = i;
+            }
+        }
+        bestNode = next[maxI].node; bestX = maxX;
+        if (maxX >= e.xEnd) { out.reachedEnd = true; break; }
+        if (nodes.size() > maxNodes) break;
+
+        if ((int)next.size() > cap) {
+            // keep the cheapest half outright, and an even spread of the rest for diversity
+            int keepCheap = cap / 2;
+            std::partial_sort(next.begin(), next.begin() + keepCheap, next.end(),
+                [](Cand const& a, Cand const& b) { return a.cost < b.cost; });
+            std::vector<Cand> kept(next.begin(), next.begin() + keepCheap);
+            std::vector<Cand> rest(next.begin() + keepCheap, next.end());
+            std::sort(rest.begin(), rest.end(), [](Cand const& a, Cand const& b) {
+                if (std::llround(a.st.y) != std::llround(b.st.y)) return a.st.y < b.st.y;
+                return a.st.vy < b.st.vy;
+            });
+            int want = cap - keepCheap;
+            double stepf = (double)rest.size() / want;
+            for (int i = 0; i < want; i++) kept.push_back(rest[(size_t)(i * stepf + (variant % 3) * stepf / 3.0)]);
+            next.swap(kept);
+        }
+        cur.swap(next);
+    }
+
+    out.reachX = bestX;
+    for (int n = bestNode; n >= 0; n = nodes[n].parent) out.down.push_back(nodes[n].down);
+    std::reverse(out.down.begin(), out.down.end());
+    return out;
+}
+
+// Independent check: replays a finished macro step by step (no zone padding, margin 0).
+// Optionally records predicted positions every 12 steps. Returns true if it reaches xEnd/ the
+// end of the macro alive; failStep gets the step of death otherwise.
+static bool verifyMacro(SState start, Env e, std::vector<uint8_t> const& down, int G,
+                        std::vector<CCPoint>* path, std::vector<float>* predMinY,
+                        int* failStep = nullptr) {
+    e.useZones = false;
+    e.margin = 0.f;
+    int step = 0;
+    for (size_t b = 0; b < down.size(); b++) {
+        for (int i = 0; i < G; i++, step++) {
+            if (path && step % 12 == 0) {
+                path->push_back({(float)(start.x + start.w * 0.5), (float)(start.y + start.h * 0.5)});
+                if (predMinY) predMinY->push_back((float)start.y);
+            }
+            if (!stepSim(start, down[b] != 0, e, step)) { if (failStep) *failStep = step; return false; }
         }
     }
-    return v;
+    return true;
 }
 // ==== SIM END
 
 // ================================================================= state
+static constexpr int kG = 2;   // the planner chooses hold/release once per kG physics steps (240 Hz)
+
 struct PFState {
     // ---- settings (saved)
-    bool  enabled      = false;   // manual drive (outside a pathfinder session)
     bool  record       = true;
     bool  autoSave     = true;
     bool  overlay      = true;
-    int   horizon      = 130;     // look-ahead, in 240 Hz steps
-    float margin       = 2.f;
-    int   cooldown     = 24;      // steps between presses (cube/ball/robot/spider)
+    bool  allowHold    = true;    // allow held inputs (otherwise taps only)
+    int   beam         = 256;     // planner width (states kept per step)
+    float margin       = 2.f;     // extra clearance around hazards
     float speed        = 10.f;    // game speed during a pathfinder session
     int   tps          = 240;     // physics steps per second (240 = vanilla)
     bool  cpsLock      = true;    // limit presses per second
@@ -291,18 +422,16 @@ struct PFState {
 
     // ---- live
     bool  inLevel      = false;
-    float nextHazard   = -1.f;
-    bool  inputSafe    = true;
-    int   jumps        = 0;
+    int   clicks       = 0;
     bool  dirty        = false;
     float percent      = 0.f;
     char const* modeName = "-";
     std::string status = "Ready.";
+    std::string planInfo = "No plan yet.";
 };
 static PFState g;
 
 enum class Phase { Idle, Mapping, Botting, Passed, GaveUp };
-struct Zone { float x0, x1; double extra; int strategy; int fails; };
 struct Session {
     bool  armed = false, active = false;
     Phase phase = Phase::Idle;
@@ -314,19 +443,33 @@ static Session sess;
 
 struct LevelMap {
     std::vector<CCRect> hz, sol;   // sorted by minX
-    float hzMaxW = 0, solMaxW = 0, length = 0;
+    std::vector<Evt> evts;         // sorted by x
+    float xEnd = 0;
+    int unsupported = 0;           // orbs / pads / dual / mirror we do not model
 };
 static LevelMap lmap;
 
+struct Plan {
+    bool valid = false, full = false;
+    int  startProg = 0;
+    std::vector<uint8_t> down;     // one entry per kG steps
+    std::vector<CCPoint> path;     // predicted centre every 12 steps
+    std::vector<float> predY;      // predicted rect minY every 12 steps
+    int  inputs = 0, holds = 0;
+    double ms = 0;
+};
+
 struct Runtime {
-    std::vector<std::pair<uint64_t, bool>> inputs; // (frame, down)
+    std::vector<std::pair<uint64_t, bool>> inputs; // (frame, down) as recorded
+    Plan   plan;
     bool   held = false;                  // real P1 input state
-    int    releaseAt = -1;
-    int    lastJump = -100000;
     int    lastPress = -100000;
     int    lastProg = -1;
+    int    lastReplan = -100000;
+    int    replans = 0;
     double floorBottom = 90.0;            // level bounds (game coords)
     double ceilTop     = 390.0;
+    double gmod = 1.0;
     double accum = 0.0;                   // TPS bypass time accumulator
     CCDrawNode* draw = nullptr;
     CCLabelBMFont* label = nullptr;
@@ -349,11 +492,11 @@ static void plog(std::string const& line) {
 // ================================================================= settings persistence
 static void saveSettings() {
     auto m = Mod::get();
-    m->setSavedValue("record", g.record);   m->setSavedValue("autosave", g.autoSave);
-    m->setSavedValue("overlay", g.overlay); m->setSavedValue("horizon", g.horizon);
-    m->setSavedValue("margin", g.margin);   m->setSavedValue("cooldown", g.cooldown);
-    m->setSavedValue("speed", g.speed);     m->setSavedValue("tps", g.tps);
-    m->setSavedValue("cpslock", g.cpsLock); m->setSavedValue("cps", g.cps);
+    m->setSavedValue("record", g.record);     m->setSavedValue("autosave", g.autoSave);
+    m->setSavedValue("overlay", g.overlay);   m->setSavedValue("allowhold", g.allowHold);
+    m->setSavedValue("beam", g.beam);         m->setSavedValue("margin", g.margin);
+    m->setSavedValue("speed", g.speed);       m->setSavedValue("tps", g.tps);
+    m->setSavedValue("cpslock", g.cpsLock);   m->setSavedValue("cps", g.cps);
     m->setSavedValue("maxattempts", g.maxAttempts);
 }
 static void loadSettings() {
@@ -361,9 +504,9 @@ static void loadSettings() {
     g.record = m->getSavedValue<bool>("record", true);
     g.autoSave = m->getSavedValue<bool>("autosave", true);
     g.overlay = m->getSavedValue<bool>("overlay", true);
-    g.horizon = m->getSavedValue<int>("horizon", 130);
+    g.allowHold = m->getSavedValue<bool>("allowhold", true);
+    g.beam = m->getSavedValue<int>("beam", 256);
     g.margin = m->getSavedValue<float>("margin", 2.f);
-    g.cooldown = m->getSavedValue<int>("cooldown", 24);
     g.speed = m->getSavedValue<float>("speed", 10.f);
     g.tps = m->getSavedValue<int>("tps", 240);
     g.cpsLock = m->getSavedValue<bool>("cpslock", true);
@@ -371,6 +514,7 @@ static void loadSettings() {
     g.maxAttempts = m->getSavedValue<int>("maxattempts", 300);
     g.tps = std::clamp(g.tps, 240, 5000);
     g.speed = std::clamp(g.speed, 1.f, 10.f);
+    g.beam = std::clamp(g.beam, 32, 1024);
 }
 
 static void setTimeScale(float v) {
@@ -460,38 +604,72 @@ static Mode modeOf(PlayerObject* p) {
     return Mode::Cube;
 }
 
-// Scans every object once and stores static hitboxes of hazards and solid blocks.
+// portals are recognised by their fixed object IDs
+static bool portalEvent(int id, Evt& ev) {
+    ev.ival = 0; ev.dval = 0;
+    switch (id) {
+        case 12:   ev.type = EvtType::SetMode; ev.ival = (int)Mode::Cube;   return true;
+        case 13:   ev.type = EvtType::SetMode; ev.ival = (int)Mode::Ship;   return true;
+        case 47:   ev.type = EvtType::SetMode; ev.ival = (int)Mode::Ball;   return true;
+        case 111:  ev.type = EvtType::SetMode; ev.ival = (int)Mode::Ufo;    return true;
+        case 660:  ev.type = EvtType::SetMode; ev.ival = (int)Mode::Wave;   return true;
+        case 745:  ev.type = EvtType::SetMode; ev.ival = (int)Mode::Robot;  return true;
+        case 1331: ev.type = EvtType::SetMode; ev.ival = (int)Mode::Spider; return true;
+        case 1933: ev.type = EvtType::SetMode; ev.ival = (int)Mode::Swing;  return true;
+        case 10:   ev.type = EvtType::SetGravity; ev.ival = 1;  return true;
+        case 11:   ev.type = EvtType::SetGravity; ev.ival = -1; return true;
+        case 99:   ev.type = EvtType::SetMini; ev.ival = 0; return true;
+        case 101:  ev.type = EvtType::SetMini; ev.ival = 1; return true;
+        case 200:  ev.type = EvtType::SetSpeed; ev.dval = 0.7; return true;
+        case 201:  ev.type = EvtType::SetSpeed; ev.dval = 0.9; return true;
+        case 202:  ev.type = EvtType::SetSpeed; ev.dval = 1.1; return true;
+        case 203:  ev.type = EvtType::SetSpeed; ev.dval = 1.3; return true;
+        case 1334: ev.type = EvtType::SetSpeed; ev.dval = 1.6; return true;
+        default: return false;
+    }
+}
+// orbs, pads, dual / mirror portals: not modelled, only counted
+static bool isUnsupported(int id) {
+    switch (id) {
+        case 35: case 36: case 67: case 84: case 140: case 141: case 1022: case 1330:
+        case 1332: case 1333: case 286: case 287: case 45: case 46: return true;
+        default: return false;
+    }
+}
+
+// Scans every object once: static hitboxes of hazards and solid blocks, plus portals.
 static void mapLevel(PlayLayer* pl) {
-    lmap.hz.clear(); lmap.sol.clear();
-    lmap.hzMaxW = lmap.solMaxW = lmap.length = 0.f;
+    lmap.hz.clear(); lmap.sol.clear(); lmap.evts.clear();
+    lmap.xEnd = 0.f; lmap.unsupported = 0;
     for (auto obj : CCArrayExt<GameObject*>(pl->m_objects)) {
         if (!obj) continue;
+        lmap.xEnd = std::max(lmap.xEnd, (float)obj->getPositionX());
+        int id = (int)obj->m_objectID;
+        if (isUnsupported(id)) lmap.unsupported++;
+
+        Evt ev{};
+        if (portalEvent(id, ev)) {
+            CCRect r = obj->getObjectRect();
+            ev.x = (float)obj->getPositionX();
+            ev.minY = r.getMinY();
+            ev.maxY = r.getMaxY();
+            lmap.evts.push_back(ev);
+            continue;
+        }
         bool hazard = obj->m_objectType == GameObjectType::Hazard;
         bool solid  = obj->m_objectType == GameObjectType::Solid;
         if (!hazard && !solid) continue;
         CCRect r = obj->getObjectRect();
         if (r.size.width <= 0.f || r.size.height <= 0.f) continue;
-        if (hazard) { lmap.hz.push_back(r);  lmap.hzMaxW  = std::max(lmap.hzMaxW,  r.size.width); }
-        else        { lmap.sol.push_back(r); lmap.solMaxW = std::max(lmap.solMaxW, r.size.width); }
-        lmap.length = std::max(lmap.length, r.getMaxX());
+        (hazard ? lmap.hz : lmap.sol).push_back(r);
     }
     auto byX = [](CCRect const& a, CCRect const& b) { return a.getMinX() < b.getMinX(); };
     std::sort(lmap.hz.begin(),  lmap.hz.end(),  byX);
     std::sort(lmap.sol.begin(), lmap.sol.end(), byX);
+    std::sort(lmap.evts.begin(), lmap.evts.end(), [](Evt const& a, Evt const& b) { return a.x < b.x; });
 }
 
-// copies the objects in [x0, x1] near height py out of a sorted list
-static void sliceMap(std::vector<CCRect> const& all, float maxW, float x0, float x1,
-                     float py, std::vector<CCRect>& out) {
-    out.clear();
-    auto it = std::lower_bound(all.begin(), all.end(), x0 - maxW,
-        [](CCRect const& r, float v) { return r.getMinX() < v; });
-    for (; it != all.end() && it->getMinX() <= x1; ++it) {
-        if (std::abs(it->getMidY() - py) <= 380.f) out.push_back(*it);
-    }
-}
-
-// ================================================================= decision logic
+// ================================================================= planning
 static void learnBounds(PlayerObject* p, Mode m) {
     // Only trust surface contact in modes that live between floor and ceiling.
     if (m == Mode::Cube || m == Mode::Robot || m == Mode::Spider) return;
@@ -501,130 +679,150 @@ static void learnBounds(PlayerObject* p, Mode m) {
     else                   rt.floorBottom = r.getMinY();
 }
 
-// extra caution learned from failed attempts near x
-static Zone const* zoneAt(float x) {
-    Zone const* best = nullptr;
-    for (auto const& z : sess.zones) {
-        if (x >= z.x0 && x <= z.x1 && (!best || z.extra > best->extra)) best = &z;
-    }
-    return best;
-}
-
-static SimParams buildParams(PlayerObject* p, Mode m, int prog) {
-    auto prof = profileFor(p->m_playerSpeed);
-    SimParams s;
-    s.start     = p->getObjectRect();
-    s.mode      = m;
-    s.mini      = p->m_vehicleSize != 1.f;
-    s.vx        = p->m_playerSpeed * prof.speedMult * 60.0;
-    s.yStart    = prof.yStart;
-    s.jumpScale = s.mini ? 0.8 : 1.0;
-    s.gBase     = prof.gravity * p->m_gravityMod;
-    s.gAlt      = kFlyGravity * p->m_gravityMod;
-    s.waveV     = p->m_playerSpeed * prof.speedMult;
-    s.flip0     = p->m_isUpsideDown ? -1.0 : 1.0;
-    s.vy0       = p->m_yVelocity;
-    s.grounded0 = p->m_isOnGround;
-    s.held0     = rt.held;
-    s.steps     = g.horizon;
-
-    auto z = zoneAt(p->getPositionX());
-    s.margin = g.margin + (z ? (float)z->extra : 0.f);
-
-    s.lockSteps = (sess.active || g.enabled) && g.cpsLock && g.cps > 0
-                    ? (int)std::lround(240.0 / g.cps) : 0;
-    s.sinceLast = (int)std::min<double>(100000.0, (prog - rt.lastPress) * 240.0 / std::max(1, g.tps));
-
-    double bottom = s.start.origin.y, top = bottom + s.start.size.height;
-    s.floorRel = std::min(0.0, rt.floorBottom - bottom);
-    s.ceilRel  = std::max(0.0, rt.ceilTop - top);
+static SState startState(PlayerObject* p, int prog) {
+    SState s;
+    auto r = p->getObjectRect();
+    s.x = r.getMinX(); s.y = r.getMinY(); s.w = r.size.width; s.h = r.size.height;
+    s.vy = p->m_yVelocity;
+    s.flip = p->m_isUpsideDown ? -1.0 : 1.0;
+    s.speed = p->m_playerSpeed;
+    s.mode = modeOf(p);
+    s.mini = p->m_vehicleSize != 1.f;
+    s.grounded = p->m_isOnGround;
+    s.down = rt.held;
+    s.accel = 0;
+    double since = rt.lastPress < -50000 ? 100000.0 : (prog - rt.lastPress) * 240.0 / std::max(1, g.tps);
+    s.lastPress = -(int)std::min(100000.0, since);
+    auto it = std::lower_bound(lmap.evts.begin(), lmap.evts.end(), (float)(s.x + s.w * 0.5),
+        [](Evt const& e, float v) { return e.x < v; });
+    s.nextEvt = (int)(it - lmap.evts.begin());
     return s;
 }
 
-static void act(PlayLayer* pl, Policy const& c, int prog) {
-    int dec = std::max(1, g.tps / 240);
-    switch (c.kind) {
-        case 1: case 4:
-            pl->handleButton(true, 1, true);
-            rt.releaseAt = prog + 1;
-            rt.lastJump = prog;
-            break;
-        case 2:
-            pl->handleButton(!rt.held, 1, true);   // flip hold state
-            break;
-        case 3:
-            pl->handleButton(true, 1, true);
-            rt.releaseAt = prog + std::max(1, c.b) * dec;
-            rt.lastJump = prog;
-            break;
-        default: return;
-    }
-    g.jumps++;
+static Env makeEnv(float marginScale, bool zones) {
+    Env e;
+    e.hz = &lmap.hz; e.sol = &lmap.sol; e.evts = &lmap.evts; e.zones = &sess.zones;
+    e.useZones = zones;
+    e.floorBottom = rt.floorBottom; e.ceilTop = rt.ceilTop;
+    e.gmod = rt.gmod;
+    e.margin = g.margin * marginScale;
+    e.lockSteps = (g.cpsLock && g.cps > 0) ? (int)std::lround(240.0 / g.cps) : 0;
+    e.allowHold = g.allowHold;
+    e.xEnd = lmap.xEnd;
+    return e;
 }
 
-// Runs once per physics step, right before the game processes input.
+static void fillPlan(Plan& pl, std::vector<uint8_t> const& down, bool full, int startProg, double ms,
+                     std::vector<CCPoint>&& path, std::vector<float>&& predY) {
+    pl.valid = true; pl.full = full; pl.startProg = startProg; pl.ms = ms;
+    pl.down = down; pl.path = std::move(path); pl.predY = std::move(predY);
+    pl.inputs = 0; pl.holds = 0;
+    int run = 0; bool prev = false;
+    for (size_t i = 0; i <= down.size(); i++) {
+        bool d = i < down.size() && down[i];
+        if (d && !prev) { pl.inputs++; run = 0; }
+        if (d) run++;
+        if (!d && prev && run > 2) pl.holds++;
+        prev = d;
+    }
+}
+
+// Plans from the player's real state: plan -> verify -> retry with other margins.
+static bool makePlan(PlayLayer* pl, char const* why) {
+    auto p = pl->m_player1;
+    if (!p) return false;
+    int prog = progress(pl);
+    rt.gmod = p->m_gravityMod;
+    sess.phase = Phase::Mapping;
+
+    SState st = startState(p, prog);
+    double minV = 0.7 * 5.980002 * 60.0 / 240.0;                       // slowest speed, units per step
+    int maxLayers = (int)(std::max(0.0, lmap.xEnd + 120.0 - st.x) / minV / kG) + 400;
+
+    struct Try { float scale; bool zones; };
+    Try tries[3] = {{1.f, true}, {0.5f, true}, {0.f, false}};
+    PlanOut bestPartial; bool havePartial = false; Env partialEnv;
+
+    for (int t = 0; t < 3; t++) {
+        Env env = makeEnv(tries[t].scale, tries[t].zones);
+        auto t0 = std::chrono::steady_clock::now();
+        PlanOut out = planMacro(st, env, kG, g.beam, sess.attempt + t, maxLayers);
+        double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+
+        if (out.reachedEnd) {
+            std::vector<CCPoint> path; std::vector<float> predY; int failStep = -1;
+            bool ok = verifyMacro(st, env, out.down, kG, &path, &predY, &failStep);
+            if (ok) {
+                fillPlan(rt.plan, out.down, true, prog, ms, std::move(path), std::move(predY));
+                g.planInfo = fmt::format("Verified macro: {} presses, {} holds, planned in {:.0f} ms (margin {:.1f}).",
+                                         rt.plan.inputs, rt.plan.holds, ms, env.margin);
+                plog(fmt::format("[plan:{}] try {} (margin {:.1f}): reached the end in {:.0f} ms | verification PASSED | {} presses, {} holds",
+                                 why, t + 1, env.margin, ms, rt.plan.inputs, rt.plan.holds));
+                sess.phase = Phase::Botting;
+                return true;
+            }
+            plog(fmt::format("[plan:{}] try {} (margin {:.1f}): reached the end but verification FAILED at step {} - retrying",
+                             why, t + 1, env.margin, failStep));
+        } else {
+            plog(fmt::format("[plan:{}] try {} (margin {:.1f}): no safe path past x={:.0f} (level end {:.0f}) - retrying",
+                             why, t + 1, env.margin, out.reachX, lmap.xEnd));
+            if (!havePartial || out.reachX > bestPartial.reachX) {
+                bestPartial = std::move(out); havePartial = true; partialEnv = env;
+            }
+        }
+    }
+
+    // nothing verified: run the furthest partial plan so the log shows where the model gives up
+    if (havePartial && !bestPartial.down.empty()) {
+        std::vector<CCPoint> path; std::vector<float> predY;
+        verifyMacro(st, partialEnv, bestPartial.down, kG, &path, &predY);
+        fillPlan(rt.plan, bestPartial.down, false, prog, 0.0, std::move(path), std::move(predY));
+        g.planInfo = fmt::format("No complete macro found. Running the best partial plan (to x={:.0f}).", bestPartial.reachX);
+        plog(fmt::format("[plan:{}] NO COMPLETE MACRO. Running partial plan to x={:.0f}.", why, bestPartial.reachX));
+    } else {
+        rt.plan = Plan{};
+        g.planInfo = "No plan could be made.";
+        plog(fmt::format("[plan:{}] NO PLAN: the model sees no safe move from here.", why));
+    }
+    sess.phase = Phase::Botting;
+    return false;
+}
+
+// ================================================================= playback
 static void tick(PlayLayer* pl) {
     int prog = progress(pl);
     if (prog == rt.lastProg) return;            // one decision per physics step
     rt.lastProg = prog;
 
-    // release a tap/pulse when it is due
-    if (rt.releaseAt >= 0 && prog >= rt.releaseAt) {
-        pl->handleButton(false, 1, true);
-        rt.releaseAt = -1;
-    }
-
     auto p = pl->m_player1;
     if (!p || p->m_isDead) return;
-    if (!(g.enabled || sess.active)) return;
+    learnBounds(p, modeOf(p));
+    if (!sess.active || !rt.plan.valid) return;
 
-    int dec = std::max(1, g.tps / 240);          // at high TPS decide ~240 times per second
-    if (prog % dec != 0) return;
+    double idx = (prog - rt.plan.startProg) * 240.0 / std::max(1, g.tps);   // 240 Hz step index
+    if (idx < 0) return;
+    int step = (int)idx;
 
-    Mode m = modeOf(p);
-    learnBounds(p, m);
-
-    if (rt.releaseAt >= 0) return;               // a tap/pulse is in progress
-    if (groundMode(m) && !p->m_isOnGround) return;
-    int cd = ((m == Mode::Ufo || m == Mode::Swing) ? 6 : g.cooldown) * dec;
-    if (!holdMode(m) || m == Mode::Robot) {
-        if (prog - rt.lastJump < cd) return;
+    // has the real run drifted away from the prediction? then plan again from the real state
+    if (step % 12 == 0 && (size_t)(step / 12) < rt.plan.predY.size() && prog - rt.lastReplan > 24) {
+        float realY = p->getObjectRect().getMinY();
+        float predY = rt.plan.predY[step / 12];
+        if (std::abs(realY - predY) > 10.f && rt.replans < 30) {
+            rt.replans++;
+            rt.lastReplan = prog;
+            plog(fmt::format("Drift at x={:.0f}: real y {:.0f} vs predicted {:.0f} - re-planning ({}).",
+                             p->getPositionX(), realY, predY, rt.replans));
+            makePlan(pl, "drift");
+            step = 0;
+        }
     }
 
-    SimParams s = buildParams(p, m, prog);
-    float px = p->getPositionX();
-    double reach = s.vx * s.steps * kStepSeconds + 80.0;
-    static std::vector<CCRect> hzW, solW;
-    sliceMap(lmap.hz,  lmap.hzMaxW,  px - 40.f, (float)(px + reach), p->getPositionY(), hzW);
-    sliceMap(lmap.sol, lmap.solMaxW, px - 40.f, (float)(px + reach), p->getPositionY(), solW);
-    if (hzW.empty() && solW.empty()) return;
-
-    Policy none{0, 0, 0};
-    int base = survive(s, none, hzW, solW);
-    if (base >= s.steps) return;                 // current input survives
-
-    auto z = zoneAt(px);
-    int strategy = z ? z->strategy : 0;          // 0 earliest, 1 latest, 2 middle safe plan
-
-    std::vector<Policy> safe;
-    Policy fallback = none;
-    int bestSurv = base;
-    for (auto const& c : candidates(m, s.steps)) {
-        int r = survive(s, c, hzW, solW);
-        if (r >= s.steps) { safe.push_back(c); if (strategy == 0) break; }
-        else if (r > bestSurv) { bestSurv = r; fallback = c; }
+    size_t block = (size_t)step / kG;
+    bool want = block < rt.plan.down.size() ? rt.plan.down[block] != 0 : false;
+    if (want != rt.held) {
+        pl->handleButton(want, 1, true);       // recorded by our handleButton hook
+        if (want) g.clicks++;
     }
-    Policy pick = fallback;
-    if (!safe.empty()) {
-        pick = strategy == 1 ? safe.back()
-             : strategy == 2 ? safe[safe.size() / 2]
-             : safe.front();
-    }
-    if (pick.kind == 0 || pick.a != 0) return;   // nothing to do yet / wait
-
-    // never fire a press the CPS lock would block
-    if (s.lockSteps > 0 && s.sinceLast < s.lockSteps && pick.kind != 2) return;
-    act(pl, pick, prog);
 }
 
 // ================================================================= pathfinder session
@@ -635,17 +833,22 @@ static void beginSession(PlayLayer* pl) {
     sess.attempt = 0;
     sess.best = 0.f;
     sess.zones.clear();
-    plog(fmt::format("=== Pathfinder session: {} (ID {}) | {}x speed, {} TPS, CPS lock {} ===",
+    plog(fmt::format("=== Pathfinder session: {} (ID {}) | {:.1f}x speed, {} TPS, CPS lock {}, holding {} ===",
         std::string(pl->m_level->m_levelName.c_str()), (int)pl->m_level->m_levelID.value(),
-        g.speed, g.tps, g.cpsLock ? std::to_string(g.cps) : std::string("off")));
+        g.speed, g.tps, g.cpsLock ? std::to_string(g.cps) : std::string("off"), g.allowHold ? "on" : "off"));
     mapLevel(pl);
-    plog(fmt::format("Mapped level: {} hazards, {} solid blocks, length {:.0f} units.",
-        lmap.hz.size(), lmap.sol.size(), lmap.length));
-    sess.phase = Phase::Botting;
+    plog(fmt::format("Mapped level: {} hazards, {} solid blocks, {} portals, end at x={:.0f}.",
+        lmap.hz.size(), lmap.sol.size(), lmap.evts.size(), lmap.xEnd));
+    if (lmap.unsupported > 0) {
+        plog(fmt::format("Warning: {} orbs/pads/dual/mirror objects are not modelled; sections needing them will fail.",
+            lmap.unsupported));
+    }
+    rt.replans = 0;
+    makePlan(pl, "start");
     setTimeScale(g.speed);
 }
 
-static void endSession(char const* why, Phase result) {
+static void endSession(std::string const& why, Phase result) {
     if (!sess.active) return;
     sess.active = false;
     sess.phase = result;
@@ -660,26 +863,25 @@ static void onFailure(PlayLayer* pl) {
     sess.attempt++;
     sess.best = std::max(sess.best, pct);
 
-    // widen the caution around the place where decisions were made
+    // add caution around the spot where the real run died
     Zone* hit = nullptr;
     for (auto& z : sess.zones) if (x >= z.x0 && x <= z.x1) { hit = &z; break; }
     if (hit) {
         hit->fails++;
         hit->extra = std::min(6.0, hit->extra + 1.0);
-        hit->strategy = (hit->strategy + 1) % 3;
     } else {
-        sess.zones.push_back({x - 220.f, x + 10.f, 1.0, 0, 1});
+        sess.zones.push_back({x - 80.f, x + 40.f, 1.0, 1});
         hit = &sess.zones.back();
     }
-    plog(fmt::format("[attempt {}] FAILED at {:.1f}% (x={:.0f}, {}) | zone +{:.0f} margin, strategy {}, fails here {}",
-        sess.attempt, pct, x, p ? modeName(modeOf(p)) : "?", hit->extra, hit->strategy, hit->fails));
+    plog(fmt::format("[attempt {}] FAILED at {:.1f}% (x={:.0f}, {}) | caution +{:.0f} here, fails here {}",
+        sess.attempt, pct, x, p ? modeName(modeOf(p)) : "?", hit->extra, hit->fails));
 
     mapLevel(pl);   // re-map before the next try
-    plog(fmt::format("Re-mapped ({} hazards, {} blocks). Trying again...", lmap.hz.size(), lmap.sol.size()));
+    plog(fmt::format("Re-mapped ({} hazards, {} blocks, {} portals). Planning again...",
+        lmap.hz.size(), lmap.sol.size(), lmap.evts.size()));
 
     if (sess.attempt >= g.maxAttempts) {
-        endSession(fmt::format("Gave up after {} attempts (best {:.1f}%).", sess.attempt, sess.best).c_str(),
-                   Phase::GaveUp);
+        endSession(fmt::format("Gave up after {} attempts (best {:.1f}%).", sess.attempt, sess.best), Phase::GaveUp);
     }
 }
 
@@ -764,20 +966,21 @@ static void drawSettings() {
     ImGui::BeginDisabled(!g.cpsLock);
     ImGui::SliderInt("Clicks per second", &g.cps, 1, 60);
     ImGui::EndDisabled();
+    ImGui::Checkbox("Allow holding", &g.allowHold);
+    ImGui::TextDisabled("Holds are used for ship, wave, robot and cube re-jumps. Off = taps only.");
     ImGui::SeparatorText("Pathfinding");
     ImGui::SliderInt("Max attempts", &g.maxAttempts, 1, 2000);
-    ImGui::SliderInt("Look-ahead (steps)", &g.horizon, 60, 300);
+    ImGui::SliderInt("Planner width", &g.beam, 32, 1024);
     ImGui::SliderFloat("Safety margin", &g.margin, 0.f, 8.f, "%.1f");
-    ImGui::SliderInt("Click cooldown", &g.cooldown, 8, 96);
     ImGui::SeparatorText("Output");
     ImGui::Checkbox("Record inputs (.gdr2)", &g.record);
     ImGui::Checkbox("Auto-save when passed", &g.autoSave);
-    ImGui::Checkbox("Show hazards + predicted arc", &g.overlay);
+    ImGui::Checkbox("Show hazards + planned path", &g.overlay);
 }
 
 static char const* phaseName(Phase p) {
     switch (p) {
-        case Phase::Idle: return "Idle";       case Phase::Mapping: return "Mapping";
+        case Phase::Idle: return "Idle";       case Phase::Mapping: return "Mapping / planning";
         case Phase::Botting: return "Botting"; case Phase::Passed: return "Passed";
         case Phase::GaveUp: return "Gave up";
     }
@@ -787,11 +990,11 @@ static char const* phaseName(Phase p) {
 static void drawSetupWindow() {
     auto ds = ImGui::GetIO().DisplaySize;
     ImGui::SetNextWindowPos({ds.x * 0.5f, ds.y * 0.5f}, ImGuiCond_Always, {0.5f, 0.5f});
-    ImGui::SetNextWindowSize({std::min(460.f, ds.x * 0.92f), std::min(620.f, ds.y * 0.92f)}, ImGuiCond_Always);
+    ImGui::SetNextWindowSize({std::min(460.f, ds.x * 0.92f), std::min(640.f, ds.y * 0.92f)}, ImGuiCond_Always);
     ImGui::Begin("Pathfinder setup", nullptr,
         ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
         ImGuiWindowFlags_NoTitleBar);
-    drawHeader("PATHFINDER", "Map the level, then bot it");
+    drawHeader("PATHFINDER", "Map, plan, verify, then bot it");
 
     if (g.setupLevel) {
         ImGui::Text("Level: %s", g.setupLevel->m_levelName.c_str());
@@ -813,7 +1016,7 @@ static void drawSetupWindow() {
 }
 
 static void drawMainWindow() {
-    ImGui::SetNextWindowSize({420, 560}, ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSize({420, 580}, ImGuiCond_FirstUseEver);
     ImGui::SetNextWindowPos({30, 30}, ImGuiCond_FirstUseEver);
     if (!ImGui::Begin("Pathfinder", &g.showMain, ImGuiWindowFlags_NoTitleBar)) { ImGui::End(); return; }
     drawHeader("PATHFINDER", "by qemugd  |  physics: camila314/gdp");
@@ -823,15 +1026,12 @@ static void drawMainWindow() {
             ImGui::Text("Phase: %s", phaseName(sess.phase));
             if (g.inLevel) {
                 ImGui::Text("Mode: %s", g.modeName);
-                ImGui::Text("Attempt: %d   Best: %.1f%%", sess.attempt, sess.best);
+                ImGui::Text("Attempt: %d   Best: %.1f%%   Re-plans: %d", sess.attempt, sess.best, rt.replans);
                 ImGui::ProgressBar(std::clamp(g.percent / 100.f, 0.f, 1.f), {-1, 0},
                     fmt::format("{:.1f}%", g.percent).c_str());
-                if (g.nextHazard >= 0.f) ImGui::Text("Next hazard: %.0f units", g.nextHazard);
-                else                     ImGui::Text("Next hazard: none in range");
-                ImGui::Text("Current input is: %s", g.inputSafe ? "safe" : "unsafe");
-                ImGui::Text("Inputs recorded: %d  (clicks: %d)", (int)rt.inputs.size(), g.jumps);
+                ImGui::TextWrapped("%s", g.planInfo.c_str());
+                ImGui::Text("Inputs recorded: %d  (presses: %d)", (int)rt.inputs.size(), g.clicks);
                 if (g.dirty) ImGui::TextColored({1.f, 0.7f, 0.2f, 1.f}, "Run has practice respawns");
-                ImGui::Checkbox("Manual drive (no session)", &g.enabled);
                 if (ImGui::Button("Save .gdr2 now", {-1, 0})) {
                     if (auto pl = PlayLayer::get()) saveReplay(pl);
                 }
@@ -852,13 +1052,14 @@ static void drawMainWindow() {
         if (ImGui::BeginTabItem("Map")) {
             ImGui::Text("Hazards mapped: %d", (int)lmap.hz.size());
             ImGui::Text("Solid blocks mapped: %d", (int)lmap.sol.size());
-            ImGui::Text("Level length: %.0f units", lmap.length);
+            ImGui::Text("Portals mapped: %d", (int)lmap.evts.size());
+            ImGui::Text("Not modelled (orbs/pads/dual/mirror): %d", lmap.unsupported);
+            ImGui::Text("Level end: x=%.0f", lmap.xEnd);
             ImGui::Text("Floor %.0f  |  Ceiling %.0f", rt.floorBottom, rt.ceilTop);
             ImGui::SeparatorText("Caution zones (from failures)");
             if (sess.zones.empty()) ImGui::TextDisabled("none yet");
             for (auto const& z : sess.zones) {
-                ImGui::BulletText("x %.0f-%.0f  +%.0f margin  strategy %d  fails %d",
-                    z.x0, z.x1, z.extra, z.strategy, z.fails);
+                ImGui::BulletText("x %.0f-%.0f  +%.0f margin  fails %d", z.x0, z.x1, z.extra, z.fails);
             }
             ImGui::EndTabItem();
         }
@@ -1011,7 +1212,7 @@ class $modify(PFBaseGameLayer, GJBaseGameLayer) {
         auto pl = PlayLayer::get();
         if (!pl || static_cast<GJBaseGameLayer*>(pl) != this) return;
         if (button != 1 || !isPlayer1) return;   // this mod only drives / records P1
-        rt.held = down;                          // real input state, used by the planner
+        rt.held = down;                          // real input state
         if (down) rt.lastPress = progress(this);
 
         if (!g.record || !m_player1 || m_player1->m_isDead) return;
@@ -1025,17 +1226,19 @@ class $modify(PFPlayLayer, PlayLayer) {
     void setupHasCompleted() {
         PlayLayer::setupHasCompleted();
         g.inLevel = true;
-        g.jumps = 0;
+        g.clicks = 0;
         g.dirty = false;
         rt.inputs.clear();
+        rt.plan = Plan{};
         rt.held = false;
-        rt.releaseAt = -1;
-        rt.lastJump = -100000;
         rt.lastPress = -100000;
         rt.lastProg = -1;
+        rt.lastReplan = -100000;
+        rt.replans = 0;
         rt.accum = 0.0;
         rt.floorBottom = 90.0;
         rt.ceilTop = 390.0;
+        g.planInfo = "No plan yet.";
 
         mapLevel(this);
 
@@ -1064,13 +1267,14 @@ class $modify(PFPlayLayer, PlayLayer) {
         } else {
             rt.inputs.clear();
             g.dirty = false;
-            g.jumps = 0;
+            g.clicks = 0;
         }
         rt.held = false;
-        rt.releaseAt = -1;
-        rt.lastJump = -100000;
         rt.lastPress = -100000;
         rt.lastProg = -1;
+        rt.lastReplan = -100000;
+        rt.replans = 0;
+        if (sess.active) makePlan(this, "retry");   // fresh plan for the new attempt
     }
 
     void destroyPlayer(PlayerObject* player, GameObject* obj) {
@@ -1089,7 +1293,7 @@ class $modify(PFPlayLayer, PlayLayer) {
         if (sess.active) {
             sess.attempt++;
             sess.best = 100.f;
-            endSession(fmt::format("PASSED on attempt {}.", sess.attempt).c_str(), Phase::Passed);
+            endSession(fmt::format("PASSED on attempt {}.", sess.attempt), Phase::Passed);
             g.status = fmt::format("Passed on attempt {}.", sess.attempt);
         }
         if (g.record && g.autoSave && !rt.inputs.empty()) saveReplay(this);
@@ -1119,32 +1323,23 @@ class $modify(PFPlayLayer, PlayLayer) {
 
         auto p = m_player1;
         if (!p || p->m_isDead) return;
-
-        Mode m = modeOf(p);
-        g.modeName = modeName(m);
-        SimParams s = buildParams(p, m, progress(this));
-
-        float px = p->getPositionX();
-        double reach = s.vx * s.steps * kStepSeconds + 80.0;
-        static std::vector<CCRect> hzW, solW;
-        sliceMap(lmap.hz,  lmap.hzMaxW,  px - 40.f, (float)(px + reach), p->getPositionY(), hzW);
-        sliceMap(lmap.sol, lmap.solMaxW, px - 40.f, (float)(px + reach), p->getPositionY(), solW);
-
-        g.nextHazard = -1.f;
-        for (auto const& r : hzW) {
-            if (r.getMinX() >= px) { g.nextHazard = r.getMinX() - px; break; }
-        }
-
-        Policy none{0, 0, 0};
-        g.inputSafe = survive(s, none, hzW, solW) >= s.steps;
+        g.modeName = modeName(modeOf(p));
 
         if (g.overlay && rt.draw) {
-            for (auto const& r : hzW) rt.draw->drawDot({r.getMidX(), r.getMidY()}, 7.f, {1.f, 0.2f, 0.2f, 0.7f});
-            std::vector<CCPoint> path;
-            survive(s, none, hzW, solW, &path);
-            ccColor4F col = g.inputSafe ? ccColor4F{0.2f, 1.f, 0.4f, 0.8f}
-                                        : ccColor4F{1.f, 0.6f, 0.1f, 0.8f};
-            for (auto const& pt : path) rt.draw->drawDot(pt, 2.5f, col);
+            float px = p->getPositionX();
+            auto it = std::lower_bound(lmap.hz.begin(), lmap.hz.end(), px - 60.f,
+                [](CCRect const& r, float v) { return r.getMinX() < v; });
+            for (int n = 0; it != lmap.hz.end() && it->getMinX() < px + 600.f && n < 60; ++it, ++n) {
+                rt.draw->drawDot({it->getMidX(), it->getMidY()}, 7.f, {1.f, 0.2f, 0.2f, 0.7f});
+            }
+            if (sess.active && rt.plan.valid) {
+                double idx = (progress(this) - rt.plan.startProg) * 240.0 / std::max(1, g.tps);
+                int from = std::max(0, (int)(idx / 12.0));
+                ccColor4F col = rt.plan.full ? ccColor4F{0.2f, 1.f, 0.4f, 0.8f} : ccColor4F{1.f, 0.6f, 0.1f, 0.8f};
+                for (int i = from; i < (int)rt.plan.path.size() && i < from + 70; i++) {
+                    rt.draw->drawDot(rt.plan.path[i], 2.5f, col);
+                }
+            }
         }
     }
 };
