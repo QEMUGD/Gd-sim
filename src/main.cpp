@@ -1,112 +1,265 @@
+// Pathfinder - Geode mod for Geometry Dash 2.2081 (Windows + Android)
+// Author: qemugd  https://github.com/qemugd/gd-sim
+//
+// What it does: plays the level with a physics look-ahead (cube mode), records
+// every input with its exact 240 TPS physics frame, and exports a .gdr2 replay
+// (GDReplayFormat v2) that Eclipse Menu and other GDR2 bots can play back.
+//
+// Credits
+//   * Physics model: camila314's GD physics decompilations (camila314/gdp,
+//     2.2 branch, used with permission). Constants and formulas below come from
+//       - PlayerObject::updateTimeMod  (yStart / gravity / speed per speed portal)
+//       - PlayerObject::updateJump     (jump = flip*yStart*v16, v16 = 0.8 if mini,
+//                                       vel -= gravity*gravityMod*dt*flip, fall clamp 15)
+//       - GJBaseGameLayer::update      (fixed 240 Hz step, dt per step = 0.25 frame units)
+//     Per-vehicle models (ship/ufo/ball/wave/robot/spider/swing) are taken from the
+//     same updateJump function (gravity factors, click velocities, clamps).
+//   * Replay format: maxnut/GDReplayFormat (gdr2)
+//   * ImGui for Cocos2d: matcool/gd-imgui-cocos
+//   * Built on Geode.
+
 #include <Geode/Geode.hpp>
 #include <Geode/modify/GJBaseGameLayer.hpp>
 #include <Geode/modify/PlayLayer.hpp>
 #include <Geode/modify/MenuLayer.hpp>
 #include <Geode/modify/PauseLayer.hpp>
-#include <Geode/modify/LevelSelectLayer.hpp>
-#include <Geode/modify/LevelInfoLayer.hpp>
 #include <imgui-cocos.hpp>
 #include <gdr/gdr.hpp>
 #include <filesystem>
 #include <chrono>
-#include <thread>
-#include <algorithm>
 
 using namespace geode::prelude;
 
-// ================================================================= Config & Physics (Up to 5000 TPS, 10x Speed, 16 CPS Lock)
-struct SimConfig {
-    int tps = 240;                  // Default 240 TPS, adjustable up to 5000 TPS
-    float speedMultiplier = 1.0f;   // Adjustable speed up to 10x
-    bool cpsLimitEnabled = true;    // 16 CPS lock enabled by default
-    int maxCps = 16;
-};
-static SimConfig cfg;
-
-static double getDt() { return 1.0 / (double)cfg.tps; }
-static constexpr double kMiniJump = 0.8;     
-static constexpr double kFallClamp = 15.0;   
+// ================================================================= physics (gdp)
+static constexpr double kDt = 0.25;   // one 240 Hz step, in 1/60 s "frame units"
+static constexpr double kStepSeconds = 1.0 / 240.0;
+static constexpr double kFallClamp = 15.0;   // ground-vehicle fall clamp
+static constexpr double kFlyGravity = 0.9582; // usedGravity for ball/flying/spider
 
 struct SpeedProfile { double yStart, gravity, speedMult; };
 
+// PlayerObject::updateTimeMod
 static SpeedProfile profileFor(float speed) {
     auto eq = [&](float v) { return std::abs(speed - v) < 0.001f; };
     if (eq(0.7f)) return {10.620032, 0.940199, 5.980002};
     if (eq(1.1f)) return {11.420032, 0.957199, 5.870002};
     if (eq(1.3f) || eq(1.6f)) return {11.230032, 0.961199, 6.000002};
-    return {11.1800318, 0.958199024, 5.77000189};
+    return {11.1800318, 0.958199024, 5.77000189}; // 0.9 (1x) and fallback
 }
+
+enum class Mode { Cube, Ship, Ufo, Ball, Wave, Robot, Spider, Swing };
+
+static Mode modeOf(PlayerObject* p) {
+    if (p->m_isShip)   return Mode::Ship;
+    if (p->m_isBird)   return Mode::Ufo;
+    if (p->m_isBall)   return Mode::Ball;
+    if (p->m_isDart)   return Mode::Wave;
+    if (p->m_isRobot)  return Mode::Robot;
+    if (p->m_isSpider) return Mode::Spider;
+    if (p->m_isSwing)  return Mode::Swing;
+    return Mode::Cube;
+}
+static char const* modeName(Mode m) {
+    switch (m) {
+        case Mode::Cube: return "Cube";   case Mode::Ship: return "Ship";
+        case Mode::Ufo: return "UFO";     case Mode::Ball: return "Ball";
+        case Mode::Wave: return "Wave";   case Mode::Robot: return "Robot";
+        case Mode::Spider: return "Spider"; case Mode::Swing: return "Swing";
+    }
+    return "?";
+}
+static bool holdMode(Mode m)   { return m == Mode::Ship || m == Mode::Wave || m == Mode::Robot; }
+static bool groundMode(Mode m) { return m == Mode::Cube || m == Mode::Ball || m == Mode::Robot || m == Mode::Spider; }
 
 struct SimParams {
     CCRect start;
-    double vx;        
-    double jumpVel;   
-    double gravity;   
-    double flip;      
+    Mode   mode;
+    bool   mini;
+    double vx;          // units per second
+    double yStart;      // base jump velocity for this speed
+    double jumpScale;   // 0.8 when mini (ground vehicles)
+    double gBase;       // profile gravity * gravityMod
+    double gAlt;        // 0.9582 * gravityMod
+    double waveV;       // wave vertical speed (playerSpeed * speedMult)
+    double flip0;
+    double vy0;
+    bool   grounded0;
+    bool   held0;
+    double surfDown, surfUp;   // landing surfaces, relative to start y
+    double floorRel, ceilRel;  // level bounds, relative to start y
     int    steps;
     float  margin;
 };
 
-// Look-ahead simulation using variable TPS
-static bool pathIsSafe(SimParams const& s, int jumpAt,
-                       std::vector<CCRect> const& hazards,
-                       std::vector<CCPoint>* outPath = nullptr) {
-    double dx = 0, dy = 0, vy = 0;
-    bool air = false, jumped = false;
+// kind: 0 keep current input, 1 click at a, 2 toggle hold at a (and back after b),
+//       3 hold from a for b steps, 4 click at a then every b steps
+struct Policy { int kind, a, b; };
+
+// Simulates the vehicle in 240 Hz steps and returns how many steps it survives
+// (== s.steps means no hazard was touched).
+static int survive(SimParams const& s, Policy const& pol,
+                   std::vector<CCRect> const& hazards,
+                   std::vector<CCPoint>* outPath = nullptr) {
+    double dx = 0, y = 0, vy = s.vy0, flip = s.flip0, accel = 0;
+    bool grounded = s.grounded0;
     float w = s.start.size.width, h = s.start.size.height;
-    double dtStep = getDt();
+    double v16fly = s.mini ? 0.85 : 1.0;
+
+    auto clampFly = [&](double lo, double hi) {   // gravity-relative clamp
+        double u = vy * flip;
+        if (u < lo) u = lo;
+        if (u > hi) u = hi;
+        vy = u * flip;
+    };
+    auto clampFall = [&]() { if (vy * flip < -kFallClamp) vy = -kFallClamp * flip; };
 
     for (int i = 0; i < s.steps; i++) {
-        if (!jumped && i == jumpAt) { vy = s.jumpVel; air = true; jumped = true; }
-        if (air) {
-            dy += vy * dtStep;
-            vy -= s.gravity * dtStep;
-            if (vy * s.flip < -kFallClamp) vy = -kFallClamp * s.flip;
-            if (dy * s.flip <= 0.0 && vy * s.flip < 0.0) { dy = 0; vy = 0; air = false; }
+        bool click = false, held = s.held0;
+        switch (pol.kind) {
+            case 1: click = (i == pol.a); break;
+            case 2:
+                if (i >= pol.a) held = !s.held0;
+                if (pol.b > 0 && i >= pol.a + pol.b) held = s.held0;
+                break;
+            case 3: held = (i >= pol.a && i < pol.a + pol.b); click = (i == pol.a); break;
+            case 4: click = (i >= pol.a && pol.b > 0 && (i - pol.a) % pol.b == 0); break;
+            default: break;
         }
-        dx += s.vx * dtStep;
 
-        CCRect r(s.start.origin.x + (float)dx, s.start.origin.y + (float)dy, w, h);
-        if (outPath && i % std::max(1, cfg.tps / 40) == 0) outPath->push_back({r.getMidX(), r.getMidY()});
+        switch (s.mode) {
+        case Mode::Cube:
+            if (click && grounded) { vy = flip * s.yStart * s.jumpScale; grounded = false; }
+            else if (!grounded)    { vy -= s.gBase * kDt * flip; clampFall(); }
+            break;
+        case Mode::Ball:
+            if (click && grounded) {
+                vy = flip * s.yStart * s.jumpScale;
+                flip = -flip;
+                vy *= 0.6;
+                grounded = false;
+            } else if (!grounded) { vy -= s.gAlt * kDt * flip * 0.6; clampFall(); }
+            break;
+        case Mode::Robot:
+            if ((click || held) && grounded) {
+                vy = flip * s.yStart * 0.5 * s.jumpScale; grounded = false; accel = 0;
+            } else if (!grounded) {
+                if (held && accel < 1.5) accel += kDt / 10.0;      // gravity cancelled while boosting
+                else { vy -= s.gBase * kDt * flip * 0.9; clampFall(); }
+            }
+            break;
+        case Mode::Spider:
+            if (click && grounded) {                // teleports to the opposite surface
+                flip = -flip;
+                y = flip > 0 ? s.surfDown : s.surfUp;
+                vy = 0; grounded = true;
+            } else if (!grounded) { vy -= s.gAlt * kDt * flip * 0.6; clampFall(); }
+            break;
+        case Mode::Ship: {
+            double dv = held ? (s.gAlt * kDt * 0.4 / v16fly)
+                             : (-1.2 * s.gAlt * kDt * 0.4 / v16fly);
+            vy += dv * flip;
+            clampFly(-6.4 / v16fly, 8.0 / v16fly);
+            break;
+        }
+        case Mode::Ufo: {
+            if (click) {
+                double v = (s.mini ? 8.0 : 7.0) * v16fly;
+                if (v > vy * flip) vy = flip * v;
+            }
+            vy -= s.gAlt * kDt * flip * 1.2 * 0.5 / v16fly;
+            clampFly(-6.4 / v16fly, 8.0 / v16fly);
+            break;
+        }
+        case Mode::Wave:
+            vy = flip * s.waveV * (held ? 1.0 : -1.0);
+            break;
+        case Mode::Swing:
+            if (click) { vy *= 0.8; flip = -flip; }
+            vy -= s.gAlt * kDt * flip * (s.mini ? 0.6 : 0.4);
+            clampFly(-8.0, 8.0);
+            break;
+        }
+
+        if (!grounded) y += vy * kDt;
+        dx += s.vx * kStepSeconds;
+
+        // surfaces: land on them (ground vehicles) or slide along them (flying/wave)
+        double floorY = groundMode(s.mode) ? s.surfDown : s.floorRel;
+        double ceilY  = groundMode(s.mode) ? s.surfUp   : s.ceilRel;
+        if (y <= floorY) {
+            y = floorY; if (vy < 0) vy = 0;
+            if (groundMode(s.mode) && flip > 0) grounded = true;
+        }
+        if (y >= ceilY) {
+            y = ceilY; if (vy > 0) vy = 0;
+            if (groundMode(s.mode) && flip < 0) grounded = true;
+        }
+
+        CCRect r(s.start.origin.x + (float)dx, s.start.origin.y + (float)y, w, h);
+        if (outPath && i % 6 == 0) outPath->push_back({r.getMidX(), r.getMidY()});
 
         for (auto const& hz : hazards) {
             CCRect t(hz.origin.x - s.margin, hz.origin.y - s.margin,
                      hz.size.width + 2 * s.margin, hz.size.height + 2 * s.margin);
-            if (r.intersectsRect(t)) return false;
+            if (r.intersectsRect(t)) return i;
         }
     }
-    return true;
+    return s.steps;
 }
 
-// ================================================================= State & Mapping Logs
-struct PFState {
-    bool  enabled      = true;    
-    bool  record       = true;    
-    bool  autoSave     = true;    
-    bool  overlay      = true;
-    int   horizon      = 250;     
-    float margin       = 2.f;
-    int   cooldown     = 16;      
+// Candidate input plans, ordered by how soon they act (earliest first).
+static std::vector<Policy> candidates(Mode m, int steps) {
+    std::vector<Policy> v;
+    if (m == Mode::Robot) {
+        for (int a : {0, 2, 4, 8, 14, 22, 32})
+            for (int b : {10, 20, 40, 60}) v.push_back({3, a, b});
+    } else if (m == Mode::Ship || m == Mode::Wave) {
+        for (int a : {0, 3, 6, 10, 15, 22, 32, 45, 60}) {
+            v.push_back({2, a, 0});
+            for (int b : {8, 16, 32}) v.push_back({2, a, b});
+        }
+    } else {
+        int lim = std::min(steps / 2, 60);
+        for (int a = 0; a <= lim; a += (a < 12 ? 1 : 3)) v.push_back({1, a, 0});
+        if (m == Mode::Ufo || m == Mode::Swing) {
+            for (int a : {0, 6, 12, 20})
+                for (int b : {10, 16, 24, 36}) v.push_back({4, a, b});
+        }
+    }
+    return v;
+}
 
+// ================================================================= state
+struct PFState {
+    bool  enabled      = true;    // drive the cube with the look-ahead
+    bool  record       = true;    // record inputs for .gdr2
+    bool  autoSave     = true;    // save when the level is completed
+    bool  overlay      = true;
+    int   horizon      = 130;     // steps (240 Hz) to look ahead
+    float margin       = 2.f;
+    int   cooldown     = 24;      // steps between jumps (cube/ball/robot/spider)
+
+    // live info
     bool  inLevel      = false;
     float nextHazard   = -1.f;
     bool  jumpSafe     = true;
     int   jumps        = 0;
-    bool  dirty        = false;   
-    int   attempts     = 1;
-    std::string status = "Ready. Level Mapper & Bot active.";
-    std::vector<std::string> matchLogs;
+    bool  dirty        = false;   // run had a practice respawn -> may not replay cleanly
+    char const* modeName = "-";
+    std::string status = "Ready.";
 };
 static PFState g;
 
 struct Runtime {
-    std::vector<GameObject*> hazards;       
-    std::vector<std::pair<uint64_t, bool>> inputs; 
-    bool   held = false;
+    std::vector<GameObject*> hazards;       // sorted by x
+    std::vector<std::pair<uint64_t, bool>> inputs; // (frame, down)
+    bool   held = false;                  // real P1 input state
     int    releaseAt = -1;
     int    lastJump = -100000;
+    int    lastProg = -1;
+    double floorBottom = 90.0;            // learned level bounds (game coords)
+    double ceilTop     = 390.0;
     CCDrawNode* draw = nullptr;
-    std::chrono::steady_clock::time_point lastClickTime = std::chrono::steady_clock::now();
 };
 static Runtime rt;
 
@@ -114,7 +267,7 @@ static int progress(GJBaseGameLayer* l) { return (int)l->m_gameState.m_currentPr
 
 // ================================================================= .gdr2 export
 struct PFReplay : gdr::Replay<PFReplay, gdr::Input<>> {
-    PFReplay() : Replay("Pathfinder Advanced", 1) {}
+    PFReplay() : Replay("Pathfinder", 1) {}
 };
 
 template <class R>
@@ -133,7 +286,7 @@ static std::optional<std::vector<uint8_t>> unwrapBytes(R&& r) {
 static std::filesystem::path replayDir() {
     std::filesystem::path dir;
     if (auto eclipse = Loader::get()->getLoadedMod("eclipse.eclipse-menu")) {
-        dir = eclipse->getSaveDir() / "replays";   
+        dir = eclipse->getSaveDir() / "replays";   // where Eclipse looks for replays
     } else {
         dir = Mod::get()->getSaveDir() / "replays";
     }
@@ -146,101 +299,81 @@ static bool saveReplay(PlayLayer* pl) {
     if (rt.inputs.empty()) { g.status = "Nothing to save: no inputs recorded."; return false; }
 
     PFReplay rep;
-    rep.author      = GJAccountManager::get()->m_username;
-    rep.description = fmt::format("Generated by Pathfinder (TPS: {}, Speed: {}x, Attempt: {})", cfg.tps, cfg.speedMultiplier, g.attempts);
+    rep.author      = std::string(GJAccountManager::get()->m_username.c_str());
+    rep.description = "Generated by Pathfinder";
     rep.gameVersion = 22081;
-    rep.framerate   = (double)cfg.tps;
+    rep.framerate   = 240.0;
     rep.seed        = 0;
     rep.coins       = 0;
     rep.ldm         = false;
     rep.platformer  = pl->m_level->isPlatformer();
-    rep.levelInfo.id   = pl->m_level->m_levelID;
-    rep.levelInfo.name = pl->m_level->m_levelName;
+    rep.levelInfo.id   = pl->m_level->m_levelID.value();
+    rep.levelInfo.name = std::string(pl->m_level->m_levelName.c_str());
 
     uint64_t last = 0;
     for (auto const& [frame, down] : rt.inputs) {
         rep.inputs.push_back(gdr::Input<>(frame, 1, false, down));
         last = frame;
     }
-    rep.duration = (float)(last / (double)cfg.tps);
+    rep.duration = (float)(last / 240.0);
 
     auto bytes = unwrapBytes(rep.exportData());
-    if (!bytes) { g.status = "Export failed (GDR could not serialize replay)."; return false; }
+    if (!bytes) { g.status = "Export failed (GDR could not serialize the replay)."; return false; }
 
-    std::string name = pl->m_level->m_levelName;
+    std::string name = std::string(pl->m_level->m_levelName.c_str());
     for (auto& c : name) if (!std::isalnum((unsigned char)c)) c = '_';
     auto stamp = std::chrono::duration_cast<std::chrono::seconds>(
         std::chrono::system_clock::now().time_since_epoch()).count();
-    auto path = replayDir() / fmt::format("{}_{}_tps{}_v{}.gdr2", name, (int)pl->m_level->m_levelID, cfg.tps, stamp);
+    auto path = replayDir() / fmt::format("{}_{}_{}.gdr2", name, (int)pl->m_level->m_levelID.value(), stamp);
 
-    auto res = file::writeBinary(path, *bytes);
+    auto res = geode::utils::file::writeBinary(path, *bytes);
     if (!res) { g.status = "Could not write file: " + path.string(); return false; }
 
-    g.status = "Saved replay: " + path.filename().string();
-    log::info("Pathfinder saved replay to {}", path.string());
+    g.status = "Saved " + path.filename().string() + (g.dirty ? "  (had practice respawns)" : "");
+    log::info("Pathfinder saved {} ({} inputs)", path.string(), rep.inputs.size());
     return true;
 }
 
-// ================================================================= Cool GUI for All Platforms (PC & Mobile)
+// ================================================================= UI
 static void drawUI() {
-    ImGui::SetNextWindowSize({460, 540}, ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSize({400, 500}, ImGuiCond_FirstUseEver);
     ImGui::SetNextWindowPos({40, 40}, ImGuiCond_FirstUseEver);
-    ImGui::Begin("Pathfinder - AI Bot & Level Mapper");
+    ImGui::Begin("Pathfinder");
 
-    ImGui::TextColored({0.2f, 1.0f, 0.4f, 1.0f}, "Status: %s", g.status.c_str());
+    ImGui::Checkbox("Drive with look-ahead", &g.enabled);
+    ImGui::Checkbox("Record inputs (.gdr2)", &g.record);
+    ImGui::Checkbox("Auto-save on level complete", &g.autoSave);
+    ImGui::Checkbox("Show hazards + predicted arc", &g.overlay);
+    ImGui::Separator();
+    ImGui::SliderInt("Look-ahead (steps)", &g.horizon, 60, 300);
+    ImGui::SliderFloat("Safety margin", &g.margin, 0.f, 8.f, "%.1f");
+    ImGui::SliderInt("Jump cooldown (steps)", &g.cooldown, 8, 96);
     ImGui::Separator();
 
-    ImGui::Checkbox("Enable Pathfinder Bot", &g.enabled);
-    ImGui::Checkbox("Record .gdr2 Replay", &g.record);
-    ImGui::Checkbox("Auto-save on Level Complete", &g.autoSave);
-    ImGui::Checkbox("Show Level Hazards & Predicted Arc", &g.overlay);
-    
-    ImGui::Separator();
-    ImGui::Text("Performance & Speed Settings:");
-    
-    // TPS Slider up to 5000 TPS
-    ImGui::SliderInt("Simulation TPS", &cfg.tps, 240, 5000);
-    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Default is 240. Scale up to 5000 for ultra-high precision look-ahead.");
-
-    // 10x Speed Multiplier Slider
-    ImGui::SliderFloat("Game Speed Multiplier", &cfg.speedMultiplier, 0.5f, 10.0f, "%.1fx");
-
-    // 16 CPS Lock (Enabled by default)
-    ImGui::Checkbox("Lock Clicks Per Second (CPS)", &cfg.cpsLimitEnabled);
-    if (cfg.cpsLimitEnabled) {
-        ImGui::SliderInt("Max CPS", &cfg.maxCps, 1, 30);
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Default limit is 16 CPS. Disable or adjust here before entering a level.");
-    }
-
-    ImGui::Separator();
-    ImGui::SliderInt("Look-ahead Horizon", &g.horizon, 60, 600);
-    ImGui::SliderFloat("Safety Margin", &g.margin, 0.f, 10.f, "%.1f");
-    ImGui::SliderInt("Jump Cooldown", &g.cooldown, 4, 60);
-
-    ImGui::Separator();
     if (g.inLevel) {
-        ImGui::Text("Attempts: %d | Recorded Jumps: %d", g.attempts, g.jumps);
-        if (ImGui::Button("Save Replay Now")) {
+        if (g.nextHazard >= 0.f) ImGui::Text("Next hazard: %.0f units", g.nextHazard);
+        else                     ImGui::Text("Next hazard: none in range");
+        ImGui::Text("Mode: %s", g.modeName);
+        ImGui::Text("Current input is: %s", g.jumpSafe ? "safe" : "unsafe");
+        ImGui::Text("Inputs recorded: %d  (jumps: %d)", (int)rt.inputs.size(), g.jumps);
+        if (g.dirty) ImGui::TextColored({1.f, 0.7f, 0.2f, 1.f}, "Run has practice respawns");
+
+        if (ImGui::Button("Save .gdr2 now")) {
             if (auto pl = PlayLayer::get()) saveReplay(pl);
         }
         ImGui::SameLine();
-        if (ImGui::Button("Reset Map & Inputs")) {
-            rt.inputs.clear();
-            rt.held = false;
-            g.status = "Inputs and level map reset.";
-        }
+        if (ImGui::Button("Clear inputs")) { rt.inputs.clear(); rt.held = false; g.status = "Cleared."; }
     } else {
-        ImGui::TextDisabled("Enter a level to start mapping and bot execution.");
-    }
-
-    if (ImGui::CollTreeNode("Mapper & Bot Logs")) {
-        for (auto const& logMsg : g.matchLogs) {
-            ImGui::TextUnformatted(logMsg.c_str());
-        }
+        ImGui::TextDisabled("Enter a level to start.");
     }
 
     ImGui::Separator();
-    ImGui::TextDisabled("Cross-Platform GUI | camila314 physics | maxnut gdr2");
+    ImGui::TextWrapped("%s", g.status.c_str());
+    ImGui::TextDisabled("Saves to: %s", replayDir().string().c_str());
+    ImGui::Separator();
+    ImGui::TextWrapped("All gamemodes. Cube is the best tested; other modes are approximate. Hazards only: blocks/orbs/pads/portals are not modelled.");
+    ImGui::TextDisabled("Physics: camila314/gdp (with permission)");
+    ImGui::TextDisabled("Format: maxnut/GDReplayFormat");
     ImGui::End();
 }
 
@@ -252,57 +385,14 @@ $on_mod(Loaded) {
             auto& io = ImGui::GetIO();
             io.IniFilename = nullptr;
 #ifdef GEODE_IS_ANDROID
-            io.FontGlobalScale = 2.0f;
-            ImGui::GetStyle().ScaleAllSizes(1.8f);
-#else
-            io.FontGlobalScale = 1.2f;
+            io.FontGlobalScale = 1.8f;
+            ImGui::GetStyle().ScaleAllSizes(1.6f);
 #endif
         })
         .draw([] { drawUI(); });
 }
 
-// ================================================================= Level Pages Integration with Geometry Dash Select Cube Button
-class $modify(PFLevelSelectLayer, LevelSelectLayer) {
-    bool init(int p0) {
-        if (!LevelSelectLayer::init(p0)) return false;
-        
-        // Add Pathfinder button with Geometry Dash select cube icon on Level Select page
-        auto menu = this->getChildByID("right-menu");
-        if (!menu) menu = CCMenu::create();
-        
-        if (auto spr = CCSprite::createWithSpriteFrameName("GJ_selectSongBtn_001.png")) {
-            spr->setScale(0.9f);
-            auto btn = CCMenuItemExt::createSpriteExtra(spr, [](CCObject*) {
-                toggleUI();
-            });
-            btn->setID("pathfinder-select-btn"_spr);
-            this->addChild(btn, 100);
-            btn->setPosition({30.f, 30.f});
-        }
-        return true;
-    }
-};
-
-class $modify(PFLevelInfoLayer, LevelInfoLayer) {
-    bool init(GJGameLevel* level, bool p1) {
-        if (!LevelInfoLayer::init(level, p1)) return false;
-
-        // Add Pathfinder button on Level Info page
-        if (auto menu = this->getChildByID("other-menu")) {
-            if (auto spr = CCSprite::createWithSpriteFrameName("GJ_optionsBtn_001.png")) {
-                spr->setScale(0.8f);
-                auto btn = CCMenuItemExt::createSpriteExtra(spr, [](CCObject*) {
-                    toggleUI();
-                });
-                btn->setID("pathfinder-info-btn"_spr);
-                menu->addChild(btn);
-                menu->updateLayout();
-            }
-        }
-        return true;
-    }
-};
-
+// ================================================================= entry buttons
 class $modify(PFMenuLayer, MenuLayer) {
     bool init() {
         if (!MenuLayer::init()) return false;
@@ -310,7 +400,7 @@ class $modify(PFMenuLayer, MenuLayer) {
             if (auto spr = CCSprite::create("logo.png"_spr)) {
                 spr->setScale(0.3f);
                 auto btn = CCMenuItemExt::createSpriteExtra(spr, [](CCObject*) { toggleUI(); });
-                btn->setID("pathfinder-main-btn"_spr);
+                btn->setID("pathfinder-button"_spr);
                 m->addChild(btn);
                 m->updateLayout();
             }
@@ -335,23 +425,41 @@ class $modify(PFPauseLayer, PauseLayer) {
     }
 };
 
-// ================================================================= Decision & Bot Logic with Level Mapping and Failure Logging
-static bool isCubeLike(PlayerObject* p) {
-    return !(p->m_isShip || p->m_isBird || p->m_isBall || p->m_isDart ||
-             p->m_isRobot || p->m_isSpider || p->m_isSwing);
+// ================================================================= decision logic
+static void learnBounds(PlayerObject* p, Mode m) {
+    // Only trust surface contact in modes that live between floor and ceiling.
+    if (m == Mode::Cube || m == Mode::Robot || m == Mode::Spider) return;
+    if (!p->m_isOnGround) return;
+    auto r = p->getObjectRect();
+    if (p->m_isUpsideDown) rt.ceilTop = r.getMaxY();
+    else                   rt.floorBottom = r.getMinY();
 }
 
-static SimParams buildParams(PlayerObject* p) {
+static SimParams buildParams(PlayerObject* p, Mode m) {
     auto prof = profileFor(p->m_playerSpeed);
     SimParams s;
-    s.start   = p->getObjectRect();
-    s.flip    = p->m_isUpsideDown ? -1.0 : 1.0;
-    double v16 = (p->m_vehicleSize != 1.f) ? kMiniJump : 1.0;
-    s.jumpVel = s.flip * prof.yStart * v16;
-    s.gravity = prof.gravity * p->m_gravityMod * s.flip;
-    s.vx      = p->m_playerSpeed * prof.speedMult * 60.0;
-    s.steps   = g.horizon;
-    s.margin  = g.margin;
+    s.start     = p->getObjectRect();
+    s.mode      = m;
+    s.mini      = p->m_vehicleSize != 1.f;
+    s.vx        = p->m_playerSpeed * prof.speedMult * 60.0;
+    s.yStart    = prof.yStart;
+    s.jumpScale = s.mini ? 0.8 : 1.0;
+    s.gBase     = prof.gravity * p->m_gravityMod;
+    s.gAlt      = kFlyGravity * p->m_gravityMod;
+    s.waveV     = p->m_playerSpeed * prof.speedMult;
+    s.flip0     = p->m_isUpsideDown ? -1.0 : 1.0;
+    s.vy0       = p->m_yVelocity;
+    s.grounded0 = p->m_isOnGround;
+    s.held0     = rt.held;
+    s.steps     = g.horizon;
+    s.margin    = g.margin;
+
+    double bottom = s.start.origin.y, top = bottom + s.start.size.height;
+    s.floorRel = std::min(0.0, rt.floorBottom - bottom);
+    s.ceilRel  = std::max(0.0, rt.ceilTop - top);
+    // ground vehicles land on whatever they are standing on right now
+    s.surfDown = (s.grounded0 && s.flip0 > 0) ? 0.0 : s.floorRel;
+    s.surfUp   = (s.grounded0 && s.flip0 < 0) ? 0.0 : s.ceilRel;
     return s;
 }
 
@@ -359,12 +467,12 @@ static std::vector<CCRect> nearHazards(PlayerObject* p, SimParams const& s, bool
     std::vector<CCRect> out;
     g.nextHazard = -1.f;
     float px = p->getPositionX();
-    double reach = s.vx * s.steps * (1.0 / (double)cfg.tps) + 100.0;
+    double reach = s.vx * s.steps * kStepSeconds + 80.0;
     for (auto h : rt.hazards) {
         float dx = h->getPositionX() - px;
         if (dx < -40.f) continue;
         if (dx > reach) break;
-        if (std::abs(h->getPositionY() - p->getPositionY()) > 250.f) continue;
+        if (std::abs(h->getPositionY() - p->getPositionY()) > 350.f) continue;
         out.push_back(h->getObjectRect());
         if (g.nextHazard < 0.f) g.nextHazard = dx;
         if (draw && rt.draw) rt.draw->drawDot(h->getPosition(), 7.f, {1.f, 0.2f, 0.2f, 0.7f});
@@ -372,76 +480,90 @@ static std::vector<CCRect> nearHazards(PlayerObject* p, SimParams const& s, bool
     return out;
 }
 
+static void act(PlayLayer* pl, Policy const& c, int prog) {
+    switch (c.kind) {
+        case 1: case 4:
+            pl->handleButton(true, 1, true);
+            rt.releaseAt = prog + 1;
+            rt.lastJump = prog;
+            break;
+        case 2:
+            pl->handleButton(!rt.held, 1, true);   // flip hold state
+            break;
+        case 3:
+            pl->handleButton(true, 1, true);
+            rt.releaseAt = prog + std::max(1, c.b);
+            rt.lastJump = prog;
+            break;
+        default: return;
+    }
+    g.jumps++;
+}
+
+// Runs once per 240 Hz physics step, right before the game processes input.
 static void tick(PlayLayer* pl) {
     int prog = progress(pl);
+    if (prog == rt.lastProg) return;            // one decision per physics step
+    rt.lastProg = prog;
 
-    // Enforce 10x speed multiplier via game time scale
-    if (pl && pl->m_timeMod != cfg.speedMultiplier) {
-        pl->m_timeMod = cfg.speedMultiplier;
-    }
-
+    // release a tap/pulse when it is due
     if (rt.releaseAt >= 0 && prog >= rt.releaseAt) {
         pl->handleButton(false, 1, true);
         rt.releaseAt = -1;
     }
 
     auto p = pl->m_player1;
-    if (!g.enabled || !p || p->m_isDead) return;
-    if (!isCubeLike(p) || !p->m_isOnGround) return;
-    if (prog - rt.lastJump < g.cooldown) return;
+    if (!p || p->m_isDead) return;
+    Mode m = modeOf(p);
+    learnBounds(p, m);
 
-    // 16 CPS Lock validation (enabled by default)
-    if (cfg.cpsLimitEnabled) {
-        auto now = std::chrono::steady_clock::now();
-        std::chrono::duration<double> elapsed = now - rt.lastClickTime;
-        double minInterval = 1.0 / (double)cfg.maxCps;
-        if (elapsed.count() < minInterval) return;
+    if (!g.enabled) return;
+    if (rt.releaseAt >= 0) return;               // a tap/pulse is in progress
+    if (groundMode(m) && !p->m_isOnGround) return;
+    int cd = (m == Mode::Ufo || m == Mode::Swing) ? 6 : g.cooldown;
+    if (!holdMode(m) || m == Mode::Robot) {
+        if (prog - rt.lastJump < cd) return;
     }
 
-    SimParams s = buildParams(p);
-    auto near = nearHazards(p, s, false);
-    if (near.empty()) return;
-    if (pathIsSafe(s, -1, near)) return;        
+    SimParams s = buildParams(p, m);
+    auto nearRects = nearHazards(p, s, false);
+    if (nearRects.empty()) return;
 
-    bool doJump;
-    if (pathIsSafe(s, 0, near)) {
-        doJump = true;                           
-    } else {
-        bool laterSafe = false;                  
-        for (int k = 1; k < s.steps / 2; k++) {
-            if (pathIsSafe(s, k, near)) { laterSafe = true; break; }
-        }
-        doJump = !laterSafe;                     
-    }
+    Policy none{0, 0, 0};
+    int base = survive(s, none, nearRects);
+    if (base >= s.steps) return;                 // current input survives
 
-    if (doJump) {
-        pl->handleButton(true, 1, true);         
-        rt.releaseAt = prog + 1;
-        rt.lastJump = prog;
-        g.jumps++;
-        if (cfg.cpsLimitEnabled) {
-            rt.lastClickTime = std::chrono::steady_clock::now();
-        }
+    Policy best = none;
+    int bestSurv = base;
+    for (auto const& c : candidates(m, s.steps)) {
+        int r = survive(s, c, nearRects);
+        if (r >= s.steps) { best = c; break; }   // earliest fully safe plan
+        if (r > bestSurv) { bestSurv = r; best = c; }
     }
+    if (best.kind == 0 || best.a != 0) return;   // nothing to do yet / wait
+    act(pl, best, prog);
 }
 
-// ================================================================= Hooks & Bot Logging
+// ================================================================= hooks
 class $modify(PFBaseGameLayer, GJBaseGameLayer) {
-    void processCommands(float dt) {
+    void processCommands(float dt, bool isHalfTick, bool isLastTick) {
         auto pl = PlayLayer::get();
         if (pl && static_cast<GJBaseGameLayer*>(pl) == this) tick(pl);
-        GJBaseGameLayer::processCommands(dt);
+        GJBaseGameLayer::processCommands(dt, isHalfTick, isLastTick);
     }
 
+    // Same place every bot records from, so frames match what Eclipse replays.
     void handleButton(bool down, int button, bool isPlayer1) {
         GJBaseGameLayer::handleButton(down, button, isPlayer1);
 
         auto pl = PlayLayer::get();
-        if (!g.record || !pl || static_cast<GJBaseGameLayer*>(pl) != this) return;
-        if (button != 1 || !m_player1 || m_player1->m_isDead) return;
-        if (!isPlayer1) return;                                
-        if (down == rt.held) return;
-        rt.held = down;
+        if (!pl || static_cast<GJBaseGameLayer*>(pl) != this) return;
+        if (button != 1 || !isPlayer1) return;   // this mod only drives / records P1
+        rt.held = down;                          // real input state, used by the planner
+
+        if (!g.record || !m_player1 || m_player1->m_isDead) return;
+        if (rt.inputs.empty() && !down) return;
+        if (!rt.inputs.empty() && rt.inputs.back().second == down) return;
         rt.inputs.emplace_back((uint64_t)progress(this), down);
     }
 };
@@ -456,8 +578,10 @@ class $modify(PFPlayLayer, PlayLayer) {
         rt.held = false;
         rt.releaseAt = -1;
         rt.lastJump = -100000;
+        rt.lastProg = -1;
+        rt.floorBottom = 90.0;
+        rt.ceilTop = 390.0;
 
-        // Map level hazards upon entering
         rt.hazards.clear();
         for (auto obj : CCArrayExt<GameObject*>(m_objects)) {
             if (obj && obj->m_objectType == GameObjectType::Hazard) rt.hazards.push_back(obj);
@@ -465,29 +589,16 @@ class $modify(PFPlayLayer, PlayLayer) {
         std::sort(rt.hazards.begin(), rt.hazards.end(),
                   [](GameObject* a, GameObject* b) { return a->getPositionX() < b->getPositionX(); });
 
-        std::string mapMsg = fmt::format("[Attempt {}] Level mapped successfully: {} hazards detected (TPS: {}, Speed: {}x).", 
-            g.attempts, rt.hazards.size(), cfg.tps, cfg.speedMultiplier);
-        g.matchLogs.push_back(mapMsg);
-        log::info("{}", mapMsg);
-
         rt.draw = CCDrawNode::create();
         m_objectLayer->addChild(rt.draw, 1000);
-        g.status = "Mapper & Bot active.";
+        g.status = "Level loaded. Play (or let the assist play) to record.";
     }
 
     void resetLevel() {
         PlayLayer::resetLevel();
-        
-        // If bot fails/dies, log failure, increment attempt, and re-map/retry
-        if (m_player1 && m_player1->m_isDead) {
-            std::string failMsg = fmt::format("[Attempt {}] Bot failed at {}%. Logging failure, re-mapping, and retrying...", g.attempts, progress(this));
-            g.matchLogs.push_back(failMsg);
-            log::warn("{}", failMsg);
-            g.attempts++;
-        }
-
         bool fromCheckpoint = m_isPracticeMode && m_checkpointArray && m_checkpointArray->count() > 0;
         if (fromCheckpoint) {
+            // keep inputs up to the restored frame; the run may not replay cleanly
             uint64_t now = (uint64_t)progress(this);
             std::erase_if(rt.inputs, [&](auto const& in) { return in.first > now; });
             g.dirty = true;
@@ -499,13 +610,11 @@ class $modify(PFPlayLayer, PlayLayer) {
         rt.held = false;
         rt.releaseAt = -1;
         rt.lastJump = -100000;
+        rt.lastProg = -1;
     }
 
     void levelComplete() {
         PlayLayer::levelComplete();
-        std::string passMsg = fmt::format("[Attempt {}] Level PASSED successfully! Replay saved.", g.attempts);
-        g.matchLogs.push_back(passMsg);
-        log::info("{}", passMsg);
         if (g.record && g.autoSave && !rt.inputs.empty()) saveReplay(this);
     }
 
@@ -519,15 +628,18 @@ class $modify(PFPlayLayer, PlayLayer) {
         PlayLayer::postUpdate(dt);
         if (rt.draw) rt.draw->clear();
         auto p = m_player1;
-        if (!p || p->m_isDead || !isCubeLike(p)) return;
+        if (!p || p->m_isDead) return;
 
-        SimParams s = buildParams(p);
-        auto near = nearHazards(p, s, g.overlay);
-        g.jumpSafe = pathIsSafe(s, 0, near);
+        Mode m = modeOf(p);
+        g.modeName = modeName(m);
+        SimParams s = buildParams(p, m);
+        auto nearRects = nearHazards(p, s, g.overlay);
+        Policy none{0, 0, 0};
+        g.jumpSafe = survive(s, none, nearRects) >= s.steps;
 
         if (g.overlay && rt.draw) {
             std::vector<CCPoint> path;
-            pathIsSafe(s, 0, near, &path);
+            survive(s, none, nearRects, &path);
             ccColor4F col = g.jumpSafe ? ccColor4F{0.2f, 1.f, 0.4f, 0.8f}
                                        : ccColor4F{1.f, 0.6f, 0.1f, 0.8f};
             for (auto const& pt : path) rt.draw->drawDot(pt, 2.5f, col);
