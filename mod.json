@@ -1,14 +1,14 @@
 {
-  "geode": "5.7.1",
+  "geode": "5.11.0",
   "gd": {
     "win": "2.2081",
     "android": "2.2081"
   },
   "id": "qemugd.pathfinder",
   "name": "Pathfinder",
-  "version": "v2.0.0",
+  "version": "v2.1.0",
   "developer": "qemugd",
-  "description": "Plays a level with a physics look-ahead and exports the inputs as a .gdr2 replay for Eclipse and other GDR2 bots. Physics from camila314's gdp.",
+  "description": "Plays levels (all gamemodes) with a physics look-ahead and exports the inputs as a .gdr2 replay for Eclipse and other GDR2 bots. Physics from camila314's gdp.",
   "tags": [
     "utility",
     "interface",
