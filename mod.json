@@ -6,9 +6,9 @@
   },
   "id": "qemugd.pathfinder",
   "name": "Pathfinder",
-  "version": "v4.0.0",
+  "version": "v5.0.0",
   "developer": "qemugd",
-  "description": "Cube button on level pages: maps the level, plans and verifies a whole-level macro (with holds), plays it, retries on failure, and exports a .gdr2 replay for Eclipse. Physics from camila314's gdp.",
+  "description": "Solves levels like gdsolver: plans an input macro, lets the game verify it, repairs it from the game's real state, then exports a .gdr2 replay for Eclipse. Physics from camila314's gdp.",
   "tags": [
     "utility",
     "interface",
