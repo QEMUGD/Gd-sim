@@ -6,7 +6,7 @@
   },
   "id": "qemugd.pathfinder",
   "name": "Pathfinder",
-  "version": "v5.0.0",
+  "version": "v5.1.0",
   "developer": "qemugd",
   "description": "Solves levels like gdsolver: plans an input macro, lets the game verify it, repairs it from the game's real state, then exports a .gdr2 replay for Eclipse. Physics from camila314's gdp.",
   "tags": [
