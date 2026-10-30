@@ -573,6 +573,12 @@ static RepairResult repairAfterDeath(Repair& r, Env planEnv, SState const& s0,
 
         Edges tail = edgesFromBlocks(out.down, G, anchor, downA);
         Edges full = prefix; full.insert(full.end(), tail.begin(), tail.end());
+        {   // the same plan again would just die the same way: go deeper instead
+            bool same = full.size() == r.edges.size();
+            for (size_t q = 0; same && q < full.size(); q++)
+                same = full[q].tick == r.edges[q].tick && full[q].down == r.edges[q].down;
+            if (same) { st->k = k + 1; continue; }
+        }
         // verify in the model (with the fixups) from the very start before handing it to the game
         Env ve = planEnv; ve.fix = &r.fix; ve.margin = 0.f;
         RunResult rr = runEdges(s0, ve, full, nullptr, 400000);
@@ -661,6 +667,13 @@ struct Runtime {
     int    lastTickSeen = -1;
     size_t edgeIdx = 0;
     bool   pendingShow = false;
+    bool   needPlan = false;                       // plan from the real tick-0 state
+    bool   deathHandled = false, completed = false;
+    bool   cmdDown = false;                        // what we last told the game
+    int    injectMode = 0;                         // 0 = handleButton, 1 = pushButton/releaseButton
+    int    noEffect = 0; bool inputOk = false, inputChecked = true;
+    int    pressStep = -1; double pressY = 0; bool pressGrounded = false; Mode pressMode = Mode::Cube;
+    std::string hudNote;
     double floorBottom = 90.0;                     // level bounds (game coords)
     double ceilTop     = 390.0;
     double gmod = 1.0;
@@ -969,6 +982,15 @@ static void planInitial(PlayLayer* pl) {
     rt.s0 = realState(p);
     rt.s0.down = false; rt.s0.lastPress = -100000;
     rep = Repair{};
+    plog(fmt::format("Start state (real, tick 0): x={:.1f} y={:.1f} size {:.0f}x{:.0f} vy={:.2f} {} speed {:.2f} grounded {}",
+        rt.s0.x, rt.s0.y, rt.s0.w, rt.s0.h, rt.s0.vy, modeName(rt.s0.mode), rt.s0.speed, rt.s0.grounded ? "yes" : "no"));
+    if (!lmap.hz.empty()) {
+        auto const& h0 = lmap.hz.front();
+        plog(fmt::format("First hazard hitbox: x={:.1f} y={:.1f} {:.0f}x{:.0f}", h0.getMinX(), h0.getMinY(), h0.size.width, h0.size.height));
+    } else {
+        plog("WARNING: no hazards were mapped. The planner will think the level is empty.");
+        rt.hudNote = "WARNING: no hazards mapped";
+    }
 
     float scales[3] = {1.f, 0.5f, 0.f};
     PlanOut bestPartial; bool havePartial = false; bool ok = false;
@@ -1001,6 +1023,12 @@ static void planInitial(PlayLayer* pl) {
         g.planInfo = fmt::format("No complete plan from the model. Starting from the best partial plan (to x={:.0f}); the game will repair it.",
                                  havePartial ? bestPartial.reachX : 0.0);
         plog("[plan] no complete plan; the repair loop will work from the best partial plan.");
+    }
+    {
+        std::string first;
+        int n = 0;
+        for (auto const& e : rep.edges) { if (n++ >= 8) break; first += fmt::format(" {}{}", e.down ? "press@" : "release@", e.tick); }
+        plog(fmt::format("Plan has {} inputs; first:{}", rep.edges.size(), first.empty() ? std::string(" (none)") : first));
     }
     recomputePred();
     sess.phase = Phase::Solving;
@@ -1042,16 +1070,18 @@ static void beginSession(PlayLayer* pl) {
         plog(fmt::format("Replaying the stored solution ({} inputs) at {:.2f}x.", e.size(), g.watchSpeed));
         return;
     }
-    planInitial(pl);
-    setTimeScale(g.speed);
+    rt.needPlan = true;                 // plan from the real state at tick 0, not from the loading screen
+    rt.hudNote = "";
+    sess.phase = Phase::Planning;
 }
 
 // the game died: the plan was wrong somewhere. Repair it from the game's own state.
-static void onDeath(PlayLayer* pl) {
-    auto p = pl->m_player1;
+static void onDeath(PlayLayer* pl, bool fromReset) {
+    rt.deathHandled = true;
     int deathTick = std::max(0, (int)rt.trace.size() - 1);
-    float pct = pl->getCurrentPercent();
-    float x = p ? p->getPositionX() : 0.f;
+    float x = rt.trace.empty() ? 0.f : (float)rt.trace.back().x;
+    float pct = (!fromReset) ? pl->getCurrentPercent()
+                             : (lmap.xEnd > 0 ? std::clamp(x / lmap.xEnd * 100.f, 0.f, 100.f) : 0.f);
     sess.attempt++;
     if (pct > sess.best) sess.best = pct;
     sess.bestTick = std::max(sess.bestTick, deathTick);
@@ -1066,16 +1096,33 @@ static void onDeath(PlayLayer* pl) {
         setTimeScale(g.speed);
     }
 
+    // the game's real tick-0 state is the truth: if the plan started from a different one, fix that first
+    if (!rt.trace.empty()) {
+        SState r0 = rt.trace[0]; r0.down = false; r0.lastPress = -100000;
+        if (std::abs(r0.x - rt.s0.x) > 0.5 || std::abs(r0.y - rt.s0.y) > 0.5 || r0.mode != rt.s0.mode) {
+            plog(fmt::format("The plan started from x={:.1f} y={:.1f} but the game started at x={:.1f} y={:.1f}; using the game's.",
+                rt.s0.x, rt.s0.y, r0.x, r0.y));
+            rt.s0 = r0;
+            recomputePred();
+        }
+    }
+
     int div = findDivergence(rt.pred, rt.trace, 5.0);
+    std::string killer = (!rt.trace.empty()) ? modeName(rt.trace.back().mode) : "?";
     plog(fmt::format("[attempt {}] DIED at {:.1f}% (tick {}, x={:.0f}, {}) | first model/game disagreement: {}",
-        sess.attempt, pct, deathTick, x, p ? modeName(modeOf(p)) : "?",
+        sess.attempt, pct, deathTick, x, killer,
         div >= 0 ? fmt::format("tick {}", div) : std::string("none (the model was blind to this)")));
+    if (div >= 0 && (size_t)div < rt.trace.size() && (size_t)div < rt.pred.size()) {
+        plog(fmt::format("    at tick {}: game y={:.1f} x={:.1f} | model y={:.1f} x={:.1f}",
+            div, rt.trace[div].y, rt.trace[div].x, rt.pred[div].y, rt.pred[div].x));
+    }
 
     auto t0 = std::chrono::steady_clock::now();
     RepairResult res = repairAfterDeath(rep, makeEnv(1.f), rt.s0, rt.pred, rt.trace, deathTick, kG, g.beam, 5.0);
     double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
     plog(fmt::format("    repair {} ({:.0f} ms, {} fixups): {}", rep.repairs, ms, rep.fix.size(), rep.note));
     g.planInfo = fmt::format("Repair {}: {} ({} fixups).", rep.repairs, rep.note, rep.fix.size());
+    if (rt.hudNote.rfind("WARNING", 0) != 0) rt.hudNote = rep.note;
 
     if (res == RepairResult::GiveUp) {
         endSession(fmt::format("Gave up at {:.1f}% after {} attempts: {}.", sess.best, sess.attempt, rep.note), Phase::GaveUp);
@@ -1086,12 +1133,51 @@ static void onDeath(PlayLayer* pl) {
     }
 }
 
+static void applyInput(PlayLayer* pl, bool want) {
+    if (rt.injectMode == 0) pl->handleButton(want, 1, true);
+    else if (want) pl->pushButton(1, true);
+    else pl->releaseButton(1, true);
+    rt.cmdDown = want;
+}
+
+// did a press really reach the game? If not, say so loudly and try the other input method.
+static void checkInputEffect(PlayLayer* pl, PlayerObject* p, int step) {
+    if (rt.inputChecked || rt.pressStep < 0 || step < rt.pressStep + 3) return;
+    rt.inputChecked = true;
+    bool groundMode2 = rt.pressMode == Mode::Cube || rt.pressMode == Mode::Robot ||
+                       rt.pressMode == Mode::Ball || rt.pressMode == Mode::Spider;
+    if (!rt.pressGrounded || !groundMode2) return;
+    double y = p->getObjectRect().getMinY();
+    bool moved = std::abs(y - rt.pressY) > 1.0 || !p->m_isOnGround;
+    if (moved) {
+        rt.noEffect = 0;
+        if (!rt.inputOk) { rt.inputOk = true; plog(fmt::format("Input check OK: the press at tick {} moved the player.", rt.pressStep)); }
+        return;
+    }
+    rt.noEffect++;
+    plog(fmt::format("Input check FAILED: the press at tick {} did not move the player ({} in a row).", rt.pressStep, rt.noEffect));
+    rt.hudNote = "WARNING: presses are not reaching the game";
+    if (rt.noEffect >= 2 && rt.injectMode == 0) {
+        rt.injectMode = 1; rt.noEffect = 0;
+        plog("Switching the input method to pushButton/releaseButton.");
+        rt.hudNote = "input method switched";
+    } else if (rt.noEffect >= 3 && rt.injectMode == 1) {
+        plog("Neither input method moves the player. Another mod may be blocking input.");
+        rt.hudNote = "no input method works - check other mods";
+    }
+}
+
 static void startAttempt() {
     rt.trace.clear();
     rt.edgeIdx = 0;
     rt.lastTickSeen = -1;
     rt.lastPressTick = -100000;
     rt.held = false;
+    rt.cmdDown = false;
+    rt.deathHandled = false;
+    rt.completed = false;
+    rt.pressStep = -1;
+    rt.inputChecked = true;
 }
 
 // Runs once per physics step, right before the game processes input.
@@ -1106,17 +1192,27 @@ static void tick(PlayLayer* pl) {
 
     int step = simTick(prog);
     if (step < 0) return;
+
+    // first tick of the first attempt: plan from the game's real start state
+    if (rt.needPlan) {
+        rt.needPlan = false;
+        planInitial(pl);
+        setTimeScale(sess.phase == Phase::Replaying ? g.watchSpeed : g.speed);
+    }
+
     // dump the game's real state at the start of every 240 Hz tick
     while ((int)rt.trace.size() <= step) rt.trace.push_back(realState(p));
-    if (step == 0 && rt.trace.size() == 1 && std::abs(rt.trace[0].y - rt.s0.y) > 1.0) {
-        plog(fmt::format("Note: the start state differs between attempts (y {:.1f} vs {:.1f}).", rt.trace[0].y, rt.s0.y));
-    }
+    checkInputEffect(pl, p, step);
 
     // apply the plan
     while (rt.edgeIdx < rep.edges.size() && rep.edges[rt.edgeIdx].tick <= step) {
         bool want = rep.edges[rt.edgeIdx++].down;
-        if (want != rt.held) {
-            pl->handleButton(want, 1, true);   // recorded by our handleButton hook
+        if (want != rt.cmdDown) {
+            if (want && rt.inputChecked) {          // remember the first press so we can check it worked
+                rt.pressStep = step; rt.pressY = p->getObjectRect().getMinY();
+                rt.pressGrounded = p->m_isOnGround; rt.pressMode = modeOf(p); rt.inputChecked = false;
+            }
+            applyInput(pl, want);
             if (want) g.clicks++;
         }
     }
@@ -1524,20 +1620,27 @@ class $modify(PFPlayLayer, PlayLayer) {
             g.dirty = false;
             g.clicks = 0;
         }
+        // a restart without a recorded death or a clear still means the attempt failed
+        if (sess.active && !rt.deathHandled && !rt.completed && !rt.needPlan && rt.trace.size() > 5 &&
+            (sess.phase == Phase::Solving || sess.phase == Phase::Showing || sess.phase == Phase::Replaying)) {
+            plog("(the level restarted without a death event; treating it as a failed attempt)");
+            onDeath(this, true);
+        }
         rt.startProg = progress(this);
         rt.lastProg = -1;
         if (sess.active) startAttempt();
     }
 
     void destroyPlayer(PlayerObject* player, GameObject* obj) {
-        bool wasDead = m_playerDied;
+        bool wasDead = m_playerDied || (player && player->m_isDead);
         PlayLayer::destroyPlayer(player, obj);
-        if (wasDead || !m_playerDied || !sess.active) return;   // anti-cheat spike etc. don't count
+        bool died = m_playerDied || (player && player->m_isDead);
+        if (wasDead || !died || !sess.active || player != m_player1) return;   // anti-cheat spike etc. don't count
         if (obj) {
             auto pos = obj->getPosition();
             plog(fmt::format("    killed by object id {} at ({:.0f}, {:.0f})", (int)obj->m_objectID, pos.x, pos.y));
         }
-        onDeath(this);
+        onDeath(this, false);
     }
 
     void levelComplete() {
@@ -1551,6 +1654,7 @@ class $modify(PFPlayLayer, PlayLayer) {
                              sess.attempt, elapsedSeconds()));
             saveSolution(this, rt.solution);
             rt.pendingShow = true;
+            rt.completed = true;
             return;
         }
         PlayLayer::levelComplete();
@@ -1591,14 +1695,16 @@ class $modify(PFPlayLayer, PlayLayer) {
         if (rt.label) {
             rt.label->setVisible(sess.active);
             if (sess.active) {
+                float lvl = lmap.xEnd > 0 ? (float)rt.trace.size() * 0.f : 0.f;
+                (void)lvl;
                 int tickNow = (int)rt.trace.size();
                 float endTick = rt.pred.empty() ? 1.f : (float)rt.pred.size();
                 std::string txt = fmt::format("Pathfinder  iter {}  {}  {:.0f}s\n"
                                               "level  [{}]  {:.1f}%   best {:.1f}%\n"
-                                              "plan   [{}]  tick {} / {}   fixups {}",
+                                              "plan   [{}]  tick {} / {}   fixups {}\n{}",
                     sess.attempt + 1, phaseName(sess.phase), elapsedSeconds(),
                     barStr(g.percent / 100.f), g.percent, sess.best,
-                    barStr(tickNow / endTick), tickNow, (int)endTick, (int)rep.fix.size());
+                    barStr(tickNow / endTick), tickNow, (int)endTick, (int)rep.fix.size(), rt.hudNote);
                 rt.label->setString(txt.c_str());
             }
         }
